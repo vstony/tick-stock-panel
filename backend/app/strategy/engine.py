@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import logging
 import sys
@@ -53,6 +54,20 @@ DEFAULT_BASIC_FILTER: dict = {
 # 叠加策略硬上限：子策略数量。控制信号计算成本与字段并集膨胀，避免 OOM。
 MAX_COMPOSITE_CHILDREN = 8
 
+# 策略来源与存放目录同名 (见 main.py: .../strategy/builtin 与 <data>/strategies/{custom,ai,composite})。
+_STRATEGY_SOURCES = frozenset({"builtin", "custom", "ai", "composite"})
+
+
+def _source_from_strategy_path(path: Path) -> str:
+    """按策略文件所在目录名判定来源 (builtin/custom/ai/composite), 未知目录按 custom。
+
+    不能用整条路径的子串判定来源: 只要仓库/数据根目录里出现 "/ai/" 这类片段, 所有策略
+    都会被误判 (实测 D:\\ai\\tick-stock-panel 下每个策略的 source 都成了 ai, 影响前端来源
+    标签、内置策略的 META 校验与删除保护)。策略文件的**直接父目录名**才是稳定依据。
+    """
+    name = path.parent.name.lower()
+    return name if name in _STRATEGY_SOURCES else "custom"
+
 
 def _normalize_param_defs(params: Any) -> list[dict]:
     """把 META["params"] 归一化为标准 list[dict] (每项含 id/label/type/default).
@@ -75,10 +90,7 @@ def _normalize_param_defs(params: Any) -> list[dict]:
         for key, val in params.items():
             if not isinstance(key, str) or not key:
                 continue
-            if isinstance(val, dict):
-                item = {"id": key, **val}
-            else:
-                item = {"id": key, "default": val}
+            item = {"id": key, **val} if isinstance(val, dict) else {"id": key, "default": val}
             items.append(item)
         return [_normalize_param_item(item) for item in items]
 
@@ -400,7 +412,7 @@ class StrategyEngine:
                 )
         except ValueError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception:
             # 文件读不到/语法错等: 不阻断, 让下方 exec_module 抛原样错误
             pass
 
@@ -424,10 +436,8 @@ class StrategyEngine:
                     sys.modules[spec.name] = previous_module
                 raise
             finally:
-                try:
+                with contextlib.suppress(ValueError):
                     sys.path.remove(inserted_path)
-                except ValueError:
-                    pass
 
         meta = dict(getattr(mod, "META", {}) or {})
         meta.setdefault("id", path.stem)
@@ -440,14 +450,7 @@ class StrategyEngine:
         meta.setdefault("descending", True)
         meta.setdefault("limit", 100)
 
-        source = "custom"
-        normalized_path = str(path).replace("\\", "/")
-        if "/builtin/" in normalized_path:
-            source = "builtin"
-        elif "/ai/" in normalized_path:
-            source = "ai"
-        elif "/composite/" in normalized_path:
-            source = "composite"
+        source = _source_from_strategy_path(path)
 
         if source == "builtin" and "asset_types" not in meta:
             raise ValueError("builtin strategy META must declare asset_types")
@@ -1463,7 +1466,7 @@ class StrategyEngine:
                     loaded = self._override_loader(cid)
                     if isinstance(loaded, dict):
                         child_override = dict(loaded)
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
             if shared_basic_filter:
                 child_override["basic_filter"] = shared_basic_filter

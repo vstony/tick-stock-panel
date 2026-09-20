@@ -85,6 +85,22 @@ def test_run_all_respects_explicit_empty_strategy_ids(tmp_path):
     assert engine.run_all(context, strategy_ids=[]) == {}
 
 
+@pytest.mark.parametrize("lookalike", ["ai", "builtin", "composite"])
+def test_strategy_source_ignores_lookalike_dirs_in_parent_path(tmp_path, lookalike):
+    """来源按策略目录名判定, 不受仓库存放路径里的同名片段影响。
+
+    实测: 仓库路径 D:/ai/tick-stock-panel 含 "/ai/", 用整条路径子串判定会把所有 custom
+    策略标成 ai(前端来源标签、内置策略 META 校验与删除保护全都会错位)。
+    """
+    custom_dir = tmp_path / lookalike / "tick-stock-panel" / "strategies" / "custom"
+    custom_dir.mkdir(parents=True)
+    (custom_dir / "lookalike.py").write_text(_strategy_code("lookalike"), encoding="utf-8")
+
+    engine = StrategyEngine(strategy_dirs=[custom_dir])
+
+    assert engine.get("lookalike").source == "custom"
+
+
 def test_builtin_custom_and_ai_files_share_one_registry_and_run_path(tmp_path):
     strategy_ids = {
         "builtin": "builtin_plugin",
