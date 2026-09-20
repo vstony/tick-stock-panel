@@ -316,6 +316,11 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - `client.py` — httpx 客户端(X-api-key 认证 + 统一信封解包 + 分页 + 页间隔限频 + 单标的日K + dump 预签名下载, S3 下载不带 Key 头)
   - `provider.py` — Provider 实现(实测/文档双字段名映射、百分数→小数制、volume 股→手、上海零点戳 +8h 时区、dump 按 release 版本缓存、软失败、Key 探测)
   - `tests/test_fuyao_provider.py` — 73 个契约测试, 是新插件的测试范本
+- **`backend/app/plugins/tushare/`** — Tushare Pro 官方 HTTP 数据源(runtime: none, 直接 POST `api.tushare.pro`, 不依赖 `tushare` SDK / pandas)
+  - 提供 `daily`(A 股 `daily` / ETF `fund_daily` / 指数 `index_daily`, 不复权原始价, 按接口 6000 行上限与逗号拼标的做行预算分批)、`adj_factor`(A 股 `adj_factor` / ETF `fund_adj`; Tushare 给的是累积因子, provider 用 `adj(D)/adj(D-1)` 换算为项目契约的单事件比值, 并按实测抖动阈值 3e-4 剔除因子修订噪声)、`minute`(`stk_mins`, 1/5/15/30/60min, 股票/ETF/指数, 按 8000 行上限做「标的数 x 时间窗」双重分批)、标的维表(`stock_basic` + 最新交易日 `daily_basic` 股本, 单位万股→股); Key 在设置页卡片直接配置(先探后存), 或 `.env` 配 `TUSHARE_API_KEY`
+  - 未声明 `realtime`(Tushare 无全市场快照, 撑不住 6s 轮询)、`depth5`(不提供)、`financial`(字段/报告期口径未逐表核对)、`full_minute`(无全市场批量端点) → 这些数据集自动回退 TickFlow
+  - `client.py` — httpx 客户端(JSON 信封解包、滑动窗口自限速 400 次/分钟、传输错误重试, Key 不进日志与异常文案)
+  - `provider.py` — Provider 实现(实测单位换算: 日K `amount` 千元→元且 `vol` 已是手; 分钟 `vol` 股→手且 `amount` 已是元; datetime 为北京墙钟; 分批软失败 + 进度回调覆盖空批; 设置页试拉先直连预检以便暴露积分/权限错误)
 - **`backend/app/plugins/stocksdk/`** — Node 型插件, 通过 subprocess 桥接调用 stock-sdk
   - `bridge.py` — Python↔Node 桥接 + availability 检测
   - `bridge.mjs` — Node 端(并发池、重试、SDK 解析)
