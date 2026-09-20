@@ -1,8 +1,9 @@
 # Tushare Pro —— 纯 YAML 自定义数据源(docs/custom-data-source.md 路线)
 #
 # 覆盖数据集: daily(A股日K) / adj_factor(A股除权因子) / minute(A股/ETF/指数分钟K)
+#            / full_minute(全量分钟: 盘中全市场当日 1 分钟K 落盘)
 #            / financial(财务: 利润表/资产负债表/现金流量表/财务指标, 可选历史股本)
-#   未声明的数据集(实时行情/五档/全量分钟)自动回退 TickFlow。
+#   未声明的数据集(实时行情/五档)自动回退 TickFlow。
 #   ETF/指数**日K**未覆盖(Tushare 需换 fund_daily/index_daily 接口, 一个数据集只有
 #   一个 url/body 模板); 需要时请把这两个数据集的日K路由到 TickFlow。
 #
@@ -15,6 +16,11 @@
 #     (短横/ISO 都返回 code=0 但 0 行 —— 静默无数据, 最易踩);
 #   - 响应是列式信封 data.fields + data.items, 由本项目按字段名解包;
 #   - 日K amount 单位为千元(需 *1000), 分钟 vol 单位为股(需 /100);
+#   - 分钟接口 `stk_mins` 单请求 **8000 行硬上限**: 超出是静默截断且丢最旧(实测 20 标的
+#     跨 2 日应回 9640 行, 实得恰好 8000 行) —— 所以 batch 要按「交易日数 × 241 根/股」折算,
+#     多日窗口请调小 batch 或改成两段拉取; full_minute 只拉当日窗口, batch=20 天然安全;
+#   - 全量分钟一轮 = 全市场(≈5400) / batch 20 ≈ 270 个请求; 实测该 key 连续 300 次调用
+#     无配额报错(36s), rpm=240 下一轮 ≈ 70s, 与服务的仅修复轮节奏下限(60s)匹配;
 #   - 财务接口: income/balancesheet/cashflow/daily_basic **不支持多标的**(逗号串静默 0 行),
 #     fina_indicator 可以; 且部分接口单次约 100 期上限(≈25 年季报, 足够回测用)。
 
@@ -91,6 +97,39 @@ datasets:
         freq: 1min
         start_date: "${start:%Y-%m-%d %H:%M:%S}"
         end_date: "${end:%Y-%m-%d %H:%M:%S}"
+    field_map:
+      ts_code: symbol
+      trade_time: datetime
+      open: open
+      high: high
+      low: low
+      close: close
+      vol: volume
+      amount: amount
+    transforms:
+      datetime: "parse_datetime(value, '%Y-%m-%d %H:%M:%S')"
+      volume: "value / 100"     # 股 → 手
+
+  # 全量分钟(doc_id=370 股票历史分钟行情 = stk_mins, 与 minute 同源接口)。
+  # 声明后即可在「设置 → 数据源 → 全量分钟」把它选为生效源: 盘中服务按当日窗口
+  # (00:00 → 现在, 北京墙钟)分批拉全市场分钟K 并幂等写入 data/kline_minute/。
+  # YAML 声明式源不提供 get_intraday_latest 廉价增量端点 → 服务自动降级为「仅修复轮」
+  # (节奏下限 60s), 数据不丢(每次都是当日全量幂等覆盖)。
+  full_minute:
+    url: http://api.tushare.pro
+    method: POST
+    batch: 20            # 20 × 241 根 ≈ 4820 行, 留足 8000 行上限余量(超限静默丢最旧)
+    rpm: 240             # 全市场一轮 ≈ 270 请求 ≈ 70s; 实测配额允许更高, 这里与服务节奏对齐
+    timeout: 30
+    response_path: data
+    body:
+      api_name: stk_mins
+      fields: "ts_code,trade_time,open,high,low,close,vol,amount"
+      params:
+        ts_code: "${symbols}"
+        freq: 1min
+        start_date: "${start:%Y-%m-%d %H:%M:%S}"   # 修复轮窗口: 当日 00:00
+        end_date: "${end:%Y-%m-%d %H:%M:%S}"       # → 现在
     field_map:
       ts_code: symbol
       trade_time: datetime

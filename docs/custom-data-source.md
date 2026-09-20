@@ -12,14 +12,18 @@
 | 除权因子 | `adj_factor` | 批量返回一组股票的复权因子 |
 | 实时行情 | `realtime` | 返回全市场快照,用于盘中 enriched 增量计算 |
 | 分钟K | `minute` | 返回 1m 分钟K(需映射出 symbol / datetime / OHLC / 量额) |
-| 全量分钟 | `full_minute` | 与 `minute` 同形;声明后可被路由为「全量分钟」生效源,内置服务盘中按当日窗口全市场批量落盘(仅修复轮语义,节奏下限 60s) |
-| 财务数据 | `financial` | 一个配置覆盖内部 5 张财务表(`metrics`/`income`/`balance_sheet`/`cash_flow`/`shares`),用 `table_map` 把内部表名映射到上游接口名 |
+| 全量分钟 | `full_minute` | 与 `minute` 同形;声明后可被路由为「全量分钟」生效源,内置服务盘中按当日窗口全市场批量落盘(仅修复轮语义,节奏下限 60s) || 财务数据 | `financial` | 一个配置覆盖内部 5 张财务表(`metrics`/`income`/`balance_sheet`/`cash_flow`/`shares`),用 `table_map` 把内部表名映射到上游接口名 |
 
 深度盘口(depth5)暂无数据集契约,仍由 TickFlow 提供。
 
 `full_minute` 声明式源只提供修复轮(当日窗口批量);廉价增量端点
 (`get_intraday_latest`)是 Python 插件契约,见
 [plugin-development.md](./plugin-development.md)。
+
+> 单请求行数上限是**静默截断**(不是报错、不翻页): 超出时上游只回前 N 条且丢最旧数据。
+> 例如 Tushare `stk_mins` 硬上限 8000 行 —— 20 标的跨 2 日应回 9640 行, 实测恰好 8000 行、
+> 且只剩后一天。因此 `batch` 必须按「单标的行数 × 窗口内天数」折算: 全量分钟只拉当日
+> (241 根/股) 可以取 20, 多日历史分钟请调小 batch 或按交易日拆成多轮调用。
 
 ## 配置位置
 
@@ -294,7 +298,7 @@ datasets:
 
 ### 完整示例: Tushare(纯 YAML 接入)
 
-仓内 `docs/examples/tushare.yaml` 是可直接复用的完整配置(日K / 除权因子 / 分钟K / 财务四表),
+仓内 `docs/examples/tushare.yaml` 是可直接复用的完整配置(日K / 除权因子 / 分钟K / 全量分钟 / 财务四表),
 拷到 `data/data_sources/` 并在 `.env` 配 `TUSHARE_API_KEY` 即可:
 
 ```yaml
@@ -335,6 +339,11 @@ datasets:
   minute:
     # ...同构: body.api_name=stk_mins, params.freq=1min,
     # 时间参数用 ${start:%Y-%m-%d %H:%M:%S}, transforms 里 volume: "value / 100"(股→手)
+  full_minute:
+    # ...同构 minute(doc_id=370 股票历史分钟行情 = stk_mins), 但拉的是当日窗口
+    # (修复轮自动传 "${start:%Y-%m-%d %H:%M:%S}" = 00:00 → 现在, 北京墙钟);
+    # 声明后即可在 设置 → 数据源 → 全量分钟 选中该源。实测该 key 连续 300 次调用无限频
+    # 报错(36s), batch=20/rpm=240 下全市场(≈5400 只)一轮 ≈ 270 请求 ≈ 70s, 与仅修复轮节奏下限 60s 匹配。
   financial:
     # ...同构: table_map 把 4 张内部表映射到 fina_indicator/income/balancesheet/cashflow,
     # body.api_name="${table}", 比率保持百分数、金额保持元、股本万股→股
