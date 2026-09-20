@@ -367,6 +367,7 @@ def _config_to_dict(config: CustomSourceConfig) -> dict:
             **({"body": dict(ds.body)} if ds.body else {}),
             **({"params": dict(ds.params)} if ds.params else {}),
             **({"adj_factor_mode": ds.adj_factor_mode} if ds.adj_factor_mode != "single" else {}),
+            **({"table_map": dict(ds.table_map)} if ds.table_map else {}),
             **({
                 "symbols_param": ds.symbols_param,
                 "start_param": ds.start_param,
@@ -534,6 +535,19 @@ def _sanitize_dataset(ds_name: str, ds_cfg: dict) -> dict:
                 f"{ds_name}: adj_factor_mode 必须是 {' 或 '.join(ADJ_FACTOR_MODES)}"
             )
         out["adj_factor_mode"] = adj_mode
+    table_map_raw = ds_cfg.get("table_map")
+    if table_map_raw:
+        if ds_name != "financial":
+            raise ValueError(f"{ds_name}: table_map 仅用于 financial 数据集")
+        if not isinstance(table_map_raw, dict):
+            raise ValueError(f"{ds_name}: table_map 必须是对象")
+        table_map = {
+            str(key).strip(): str(value).strip()
+            for key, value in table_map_raw.items()
+            if str(key).strip() and str(value).strip()
+        }
+        if table_map:
+            out["table_map"] = table_map
     request_params = [
         out.get("symbols_param", "symbols"),
         out.get("start_param", "start_time"),

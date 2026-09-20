@@ -454,6 +454,7 @@ class DatasetConfigIn(BaseModel):
     body: dict = {}
     params: dict = {}
     adj_factor_mode: str | None = None
+    table_map: dict[str, str] = {}
     symbols_param: str = "symbols"
     start_param: str = "start_time"
     end_param: str = "end_time"

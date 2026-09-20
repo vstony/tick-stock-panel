@@ -45,6 +45,11 @@ class DatasetConfig:
     pct_unit: str | None = None
     # adj_factor 专用: 上游因子是单事件比值还是累积值(默认 single)。
     adj_factor_mode: str = "single"
+    # financial 专用: 内部表名 → 上游取值(参数值/接口名)。
+    # 内部固定五张表(metrics/income/balance_sheet/cash_flow/shares), 各供应商命名不同,
+    # 且不少网关把接口名放在请求体里(Tushare 的 api_name), 故需显式映射;
+    # 未列出的表名原样传给上游。
+    table_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -93,6 +98,15 @@ def _dataset_from_dict(raw: dict[str, Any]) -> DatasetConfig:
             f"adj_factor_mode must be one of {', '.join(ADJ_FACTOR_MODES)}, got {adj_mode!r}"
         )
 
+    table_map_raw = raw.get("table_map") or {}
+    if not isinstance(table_map_raw, dict):
+        raise ValueError("table_map must be a mapping of {内部表名: 上游取值}")
+    table_map = {
+        str(key).strip(): str(value).strip()
+        for key, value in table_map_raw.items()
+        if str(key).strip() and str(value).strip()
+    }
+
     return DatasetConfig(
         url=str(raw.get("url", "") or ""),
         method=str(raw.get("method", "GET") or "GET").upper(),
@@ -111,6 +125,7 @@ def _dataset_from_dict(raw: dict[str, Any]) -> DatasetConfig:
         freq_param=(str(raw.get("freq_param") or "").strip() or None),
         pct_unit=pct_unit,
         adj_factor_mode=adj_mode,
+        table_map=table_map,
     )
 
 

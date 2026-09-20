@@ -103,7 +103,10 @@ def map_rows(rows: list[dict], field_map: dict[str, str]) -> pl.DataFrame:
     if not rows:
         return pl.DataFrame()
     try:
-        df = pl.DataFrame(rows)
+        # infer_schema_length=None: 按全部行推断类型。默认只扫前 100 行, 当上游一次
+        # 返回 >100 条(如 Tushare 财报单股 100+ 期)且后段出现前段未见的浮点列时,
+        # 构造会失败并整块丢数据(实测利润表 129 行 → 0 行)。
+        df = pl.DataFrame(rows, infer_schema_length=None)
     except (TypeError, ValueError, pl.exceptions.PolarsError) as e:
         # 异构嵌套(如把整个信封当一行)会让 polars 构造失败; 返回空 + 告警,
         # 避免同步任务带着 polars 内部异常栈失败
@@ -131,6 +134,9 @@ def apply_transforms(df: pl.DataFrame, transforms: dict[str, str]) -> pl.DataFra
         elif text == "value * 1000":
             # 常见上游单位: 成交额以千元计(Tushare daily/fund_daily/index_daily)
             out = out.with_columns((pl.col(col).cast(pl.Float64, strict=False) * 1000).alias(col))
+        elif text == "value * 10000":
+            # 常见上游单位: 股本以万股计(Tushare daily_basic), 内部一律口径为股
+            out = out.with_columns((pl.col(col).cast(pl.Float64, strict=False) * 10000).alias(col))
         elif text == "value / 100":
             out = out.with_columns((pl.col(col).cast(pl.Float64, strict=False) / 100).alias(col))
         elif text == "value / 10000":
@@ -144,6 +150,13 @@ def apply_transforms(df: pl.DataFrame, transforms: dict[str, str]) -> pl.DataFra
             fmt = _extract_format(text) or "%Y-%m-%d %H:%M:%S"
             out = out.with_columns(
                 pl.col(col).cast(pl.Utf8, strict=False).str.strptime(pl.Datetime, format=fmt, strict=False).alias(col)
+            )
+        else:
+            # 白名单外的表达式不执行: 静默跳过会让"单位没换算"表现为看似合理的错误数值
+            logger.warning(
+                "自定义源 transforms 表达式不支持, 已跳过: %s = %r (可用: value * 100 / * 1000 / * 10000 "
+                "/ / 100 / / 10000 / parse_date(...) / parse_datetime(...))",
+                col, expr,
             )
     return out
 

@@ -152,6 +152,9 @@ class GenericHTTPProvider:
                     "auth.type=body 只在 POST 请求体里有位置, "
                     f"以下数据集不是 POST: {', '.join(non_post)}"
                 )
+        for dataset, cfg in self.config.datasets.items():
+            if cfg.table_map and dataset != "financial":
+                errors.append(f"{dataset}: table_map 仅用于 financial 数据集(内部表名→上游表名)")
         return errors
 
     def _request_rows_retry(
@@ -370,29 +373,53 @@ class GenericHTTPProvider:
 
         custom 源用一个 'financial' dataset 配置覆盖全部财务表; 请求时把 table 作为参数传给上游,
         上游根据 table 返回对应数据。字段由数据源决定, 这里只确保有 symbol 列。
+        内部表名 → 上游取值由 `table_map` 映射(如 metrics→fina_indicator); 声明了 table_map
+        时它就是**支持范围**: 未声明的表直接跳过(如 Tushare 的 shares 只能按交易日取、
+        单标的 6000 行, 默认不开)。
         """
         cfg = self._dataset("financial")
+        if cfg.table_map and table not in cfg.table_map:
+            logger.info(
+                "自定义源 %s: table_map 未声明 %s, 跳过该表", self.name, table,
+            )
+            return pl.DataFrame()
         frames: list[pl.DataFrame] = []
         chunks = chunked(symbols, cfg.batch)
         for i, chunk in enumerate(chunks):
             sleep_between_batches(i, cfg.rpm)
+            upstream_table = cfg.table_map.get(table, table)
             # 把 table 注入到请求参数 (上游据此区分财务表)
-            extra_params = {**cfg.params, "table": table}
-            extra_body = {**cfg.body, "table": table}
+            extra_params = {**cfg.params, "table": upstream_table}
+            extra_body = {**cfg.body, "table": upstream_table}
             if table == "shares":
                 extra_params["latest"] = latest_only
                 extra_body["latest"] = latest_only
             rows = self._request_rows(
                 cfg, symbols=chunk,
                 override_params=extra_params, override_body=extra_body,
-                template_context={"table": table},
+                template_context={"table": upstream_table},
             )
             df = self._mapped_frame(cfg, rows)
             if not df.is_empty():
                 frames.append(df)
         if not frames:
             return pl.DataFrame()
-        return pl.concat(frames, how="diagonal_relaxed")
+        merged = pl.concat(frames, how="diagonal_relaxed")
+        return self._dedup_report_periods(merged)
+
+    @staticmethod
+    def _dedup_report_periods(df: pl.DataFrame) -> pl.DataFrame:
+        """财务表契约: (symbol, period_end) 唯一。
+
+        实测 Tushare balancesheet/income 会对同一报告期返回完全重复的行(ann_date 也相同),
+        留着会让落盘表出现同期两行、下游 join 翻倍。同期有多个公告日时保留最新公告的那行
+        (准则调整/重述以新披露为准), 与 services.financial_sync._merge_report_history 同语义。
+        """
+        if df.is_empty() or not {"symbol", "period_end"} <= set(df.columns):
+            return df
+        if "announce_date" in df.columns:
+            df = df.sort("announce_date", nulls_last=False)
+        return df.unique(subset=["symbol", "period_end"], keep="last")
 
     @classmethod
     def _normalize_minute(cls, df: pl.DataFrame) -> pl.DataFrame:
@@ -481,8 +508,9 @@ class GenericHTTPProvider:
 
     def _mapped_frame(self, cfg: DatasetConfig, rows: list[dict]) -> pl.DataFrame:
         df = map_rows(rows, cfg.field_map)
-        if rows and df.is_empty():
-            # 响应有内容但一个字段都对不上: 绝不能静默当空数据(否则用户只看到 0 行)
+        if rows and df.is_empty() and not (set(rows[0]) & set(cfg.field_map)):
+            # 响应有内容但一个字段都对不上: 绝不能静默当空数据(否则用户只看到 0 行)。
+            # 构造失败(map_rows 已告警)时字段其实能对上, 不重复误导。
             logger.warning(
                 "自定义源 %s: 上游返回 %d 条记录但无任何字段可映射, "
                 "请核对 response_path/field_map 与上游字段名(响应字段样例: %s)",
