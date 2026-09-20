@@ -1,0 +1,102 @@
+# Tushare Pro —— 纯 YAML 自定义数据源(docs/custom-data-source.md 路线)
+#
+# 覆盖数据集: daily(A股日K) / adj_factor(A股除权因子) / minute(A股/ETF/指数分钟K)
+#   未声明的数据集(实时行情/五档/财务/全量分钟)自动回退 TickFlow。
+#   ETF/指数**日K**未覆盖(Tushare 需换 fund_daily/index_daily 接口, 一个数据集只有
+#   一个 url/body 模板); 需要时请把这两个数据集的日K路由到 TickFlow。
+#
+# Key: 复用 .env / 环境变量 TUSHARE_API_KEY(auth.type=body → 注入 POST 请求体, 参数名 token)
+#
+# 协议要点(均经实测, 详见 docs/custom-data-source.md「上游响应形状」「请求模板」两节):
+#   - token 必须在请求体, 放查询串/请求头会返回 code=40101;
+#   - 业务参数必须嵌套在 body.params 下, 顶层平铺会被忽略;
+#   - ts_code 必须是逗号串(数组会被当无数据); 日期只认紧凑 YYYYMMDD
+#     (短横/ISO 都返回 code=0 但 0 行 —— 静默无数据, 最易踩);
+#   - 响应是列式信封 data.fields + data.items, 由本项目按字段名解包;
+#   - 日K amount 单位为千元(需 *1000), 分钟 vol 单位为股(需 /100)。
+
+name: tushare_api
+display_name: "Tushare (HTTP 自定义源)"
+
+auth:
+  type: body
+  param: token
+  token_env: TUSHARE_API_KEY
+
+datasets:
+  daily:
+    url: http://api.tushare.pro
+    method: POST
+    batch: 20            # 单请求标的数: 接口单次 6000 行上限, 按窗口交易日数留余量
+    rpm: 240             # 接口按积分等级限频, 此处保守自限速
+    timeout: 30
+    response_path: data
+    body:
+      api_name: daily
+      fields: "ts_code,trade_date,open,high,low,close,vol,amount"
+      params:
+        ts_code: "${symbols}"
+        start_date: "${start:%Y%m%d}"
+        end_date: "${end:%Y%m%d}"
+    field_map:
+      ts_code: symbol
+      trade_date: date
+      open: open
+      high: high
+      low: low
+      close: close
+      vol: volume
+      amount: amount
+    transforms:
+      date: "parse_date(value, '%Y%m%d')"
+      amount: "value * 1000"    # 千元 → 元
+
+  adj_factor:
+    url: http://api.tushare.pro
+    method: POST
+    batch: 20
+    rpm: 240
+    timeout: 30
+    response_path: data
+    adj_factor_mode: cumulative   # 上游给累积因子 → 本项目换算为单事件比值
+    body:
+      api_name: adj_factor
+      fields: "ts_code,trade_date,adj_factor"
+      params:
+        ts_code: "${symbols}"
+        start_date: "${start:%Y%m%d}"
+        end_date: "${end:%Y%m%d}"
+    field_map:
+      ts_code: symbol
+      trade_date: trade_date
+      adj_factor: ex_factor
+    transforms:
+      trade_date: "parse_date(value, '%Y%m%d')"
+
+  minute:
+    url: http://api.tushare.pro
+    method: POST
+    batch: 20            # 单请求标的数: 接口单次 8000 行上限(单日 1min ≈ 241 根/股)
+    rpm: 240
+    timeout: 30
+    response_path: data
+    body:
+      api_name: stk_mins
+      fields: "ts_code,trade_time,open,high,low,close,vol,amount"
+      params:
+        ts_code: "${symbols}"
+        freq: 1min
+        start_date: "${start:%Y-%m-%d %H:%M:%S}"
+        end_date: "${end:%Y-%m-%d %H:%M:%S}"
+    field_map:
+      ts_code: symbol
+      trade_time: datetime
+      open: open
+      high: high
+      low: low
+      close: close
+      vol: volume
+      amount: amount
+    transforms:
+      datetime: "parse_datetime(value, '%Y-%m-%d %H:%M:%S')"
+      volume: "value / 100"     # 股 → 手

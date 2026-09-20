@@ -182,9 +182,122 @@ timeout: 60
 
 留空或省略时用默认 30 秒，可配置范围为大于 0 且不超过 300 秒；该值对数据同步与「试拉测试」均生效。在设置页编辑数据源时可在「超时」输入框修改（与 批量 / RPM / 响应路径 同行）。「试拉测试」直接使用当前表单内容，新建数据源或尚未保存的修改也可测试。
 
+### 请求模板(${...} 占位符)
+
+有些上游的请求格式无法用「固定 URL + 固定参数名」表达: token 必须放请求体、业务参数要求嵌套、
+标的要用逗号串、日期只认紧凑 `YYYYMMDD`(实测 Tushare 收到短横/ISO 会返回 `code=0` 但 **0 行**)。
+在这些数据集的 `body` / `params` 里写占位符即可声明式描述协议:
+
+```yaml
+body:
+  api_name: daily
+  fields: "ts_code,trade_date,open,high,low,close,vol,amount"
+  params:
+    ts_code: "${symbols}"            # 逗号拼接的标的串 600519.SH,000001.SZ
+    start_date: "${start:%Y%m%d}"     # 指定 strftime 格式
+    end_date: "${end:%Y%m%d}"
+```
+
+| 变量 | 含义 |
+| --- | --- |
+| `${symbols}` | 本批标的, 逗号拼接 |
+| `${start}` / `${end}` | 请求窗口起止; 可加 `:%Y%m%d` 等格式 |
+| `${table}` | 财务表名(`financial` 数据集) |
+| `${asset_type}` / `${freq}` | 资产类型 / 周期(`minute`、`full_minute`) |
+
+- 值不存在(None) 渲染为空串; **未知变量保留原样**并告警, 便于上游报错时定位(只做字面替换, 不求值)。
+- 声明了任一占位符的数据集, 其余参数名/窗口**不再默认注入**(否则注入的标的列表会破坏这类协议),
+  即该数据集的请求完全由模板描述。
+
+### 上游响应形状(记录列表 / 列式信封)
+
+`response_path` 定位到的节点支持两种记录形状, 其他形状明确告警并跳过, 不猜列序——猜错只会
+静默生成看似合理的错误行情:
+
+| 上游返回 | 结果 |
+| --- | --- |
+| `{"data": [{"ts_code": "600519.SH", "close": 1467.96}]}` | ✅ 逐条映射 |
+| `{"data": {"ts_code": "600519.SH", "close": 1467.96}}` | ✅ 按单条记录处理 |
+| `{"data": {"fields": ["ts_code", ...], "items": [["600519.SH", ...]]}}` | ✅ 列式信封: 按字段名与位置解包 |
+| `{"data": {"items": [["600519.SH", ...]]}}` | ❌ 纯位置数组(无字段名) → 告警 + 空数据 |
+
+启用 token 放在请求体(`auth.type: body`)的数据集, 若上游把错误放在 HTTP 200 的 `code`/`msg` 里
+(如 Tushare 40101/40203), 本项目会记一条 WARNING 指出业务错误码——不让它只表现为"0 行"。
+
+单位换算用 `transforms`, 支持固定表达式白名单: `value * 100` / `value * 1000` / `value / 100` /
+`value / 10000` / `parse_date(value, '格式')` / `parse_datetime(value, '格式')`。不支持任意算式。
+
+### 复权因子口径: adj_factor_mode
+
+内部 `ex_factor` 契约是**单事件比值**(除权前收盘价 / 除权参考价, 通常 > 1), 累积链由本项目
+pipeline 按交易日自建。上游给的是**累积**因子时(Tushare `adj_factor`、同花顺事件 dump 等),
+必须声明由本项目换算:
+
+```yaml
+datasets:
+  adj_factor:
+    adj_factor_mode: cumulative   # 默认 single(上游直接给单事件比值)
+```
+
+换算规则: `ex_factor = factor(D) / factor(前一交易日)`(累积乘积恰好还原上游累积序列),
+取数窗口会自动向前多取 40 天回看(否则窗口首个除权日会因缺"前一交易日因子"而丢失),
+换算后再裁回请求窗口; 因子修订抖动与超出量级的值一律剔除。
+
+### 完整示例: Tushare(纯 YAML 接入)
+
+仓内 `docs/examples/tushare.yaml` 是可直接复用的完整配置(日K / 除权因子 / 分钟K 三个数据集),
+拷到 `data/data_sources/` 并在 `.env` 配 `TUSHARE_API_KEY` 即可:
+
+```yaml
+auth:
+  type: body            # token 进 POST 请求体(参数名 token)
+  param: token
+  token_env: TUSHARE_API_KEY
+
+datasets:
+  daily:
+    url: http://api.tushare.pro
+    method: POST
+    batch: 20            # 接口单次 6000 行上限, 按窗口交易日数留余量
+    rpm: 240
+    response_path: data  # 列式信封由本项目解包
+    body:
+      api_name: daily
+      fields: "ts_code,trade_date,open,high,low,close,vol,amount"
+      params:
+        ts_code: "${symbols}"
+        start_date: "${start:%Y%m%d}"
+        end_date: "${end:%Y%m%d}"
+    field_map:
+      ts_code: symbol
+      trade_date: date
+      open: open
+      high: high
+      low: low
+      close: close
+      vol: volume
+      amount: amount
+    transforms:
+      date: "parse_date(value, '%Y%m%d')"
+      amount: "value * 1000"          # 千元 → 元
+
+  adj_factor:
+    # ...同构: body.api_name=adj_factor + adj_factor_mode: cumulative
+  minute:
+    # ...同构: body.api_name=stk_mins, params.freq=1min,
+    # 时间参数用 ${start:%Y-%m-%d %H:%M:%S}, transforms 里 volume: "value / 100"(股→手)
+```
+
+覆盖范围与注意: 日K仅 A 股(`daily`)——ETF/指数日K需换 `fund_daily`/`index_daily` 接口, 而一个数据集
+只能有一个 url/body 模板, 故这两个数据集的日K请路由到 TickFlow(或另写一个插件);
+分钟K(`stk_mins`)对股票/ETF/指数通用。
+
+> `body` / `params` / `adj_factor_mode` 没有设置页表单控件, 但会在配置回填与保存时**原样保留**;
+> 修改这三项请直接编辑 `data/data_sources/*.yaml` 后点「重新加载」。
+
 ## 鉴权
 
-支持三种简单鉴权:
+支持四种鉴权:
 
 ```yaml
 auth:
@@ -206,7 +319,15 @@ auth:
   token_env: MY_DATA_TOKEN
 ```
 
-Token 可以放在系统环境变量或项目 `.env` 中。
+```yaml
+auth:
+  type: body            # Token 注入 POST 请求体(参数名 param, 默认 token)
+  param: token
+  token_env: TUSHARE_API_KEY
+```
+
+Token 可以放在系统环境变量或项目 `.env` 中。`type: body` 只适用于 POST 数据集(否则配置校验报错);
+Token 需要放进请求体时**用它而不是把密钥写进 `body` 模板**, 避免密钥进配置文件与日志。
 
 ## 联调流程
 
@@ -283,7 +404,9 @@ cp docs/examples/custom-data-source/mock_source.yaml data/data_sources/mock_sour
 除权因子 (adj_factor):
   symbol = 股票代码
   trade_date = 除权日期
-  ex_factor = 复权因子
+  ex_factor = 复权因子, **单事件比值(非累积)**: 即 除权前收盘价 / 除权参考价(通常 > 1);
+              累积链由本项目 pipeline 按交易日自建。上游若只能给累积因子(Tushare adj_factor 等),
+              必须在上游换算为相邻交易日因子之比后再返回
 
 实时行情 (realtime):
   symbol = 股票代码
