@@ -13,7 +13,7 @@
 | 实时行情 | `realtime` | 返回全市场快照,用于盘中 enriched 增量计算 |
 | 分钟K | `minute` | 返回 1m 分钟K(需映射出 symbol / datetime / OHLC / 量额) |
 | 全量分钟 | `full_minute` | 与 `minute` 同形;声明后可被路由为「全量分钟」生效源,内置服务盘中按当日窗口全市场批量落盘(仅修复轮语义,节奏下限 60s) |
-| 财务数据 | `financial` | 一个配置覆盖全部财务表,请求时把表名作为参数传给上游;字段由数据源决定,仅需映射出 symbol |
+| 财务数据 | `financial` | 一个配置覆盖内部 5 张财务表(`metrics`/`income`/`balance_sheet`/`cash_flow`/`shares`),用 `table_map` 把内部表名映射到上游接口名 |
 
 深度盘口(depth5)暂无数据集契约,仍由 TickFlow 提供。
 
@@ -202,7 +202,7 @@ body:
 | --- | --- |
 | `${symbols}` | 本批标的, 逗号拼接 |
 | `${start}` / `${end}` | 请求窗口起止; 可加 `:%Y%m%d` 等格式 |
-| `${table}` | 财务表名(`financial` 数据集) |
+| `${table}` | 财务表名(`financial` 数据集), 已按 `table_map` 映射成上游接口名 |
 | `${asset_type}` / `${freq}` | 资产类型 / 周期(`minute`、`full_minute`) |
 
 - 值不存在(None) 渲染为空串; **未知变量保留原样**并告警, 便于上游报错时定位(只做字面替换, 不求值)。
@@ -243,9 +243,58 @@ datasets:
 取数窗口会自动向前多取 40 天回看(否则窗口首个除权日会因缺"前一交易日因子"而丢失),
 换算后再裁回请求窗口; 因子修订抖动与超出量级的值一律剔除。
 
+### 财务数据集: 表名映射与单位(table_map)
+
+一个 `financial` 数据集要覆盖多张上游接口(利润表、资产负债表…), 靠 `table_map` 把**内部表名**
+映射成**上游取值**; 该值经 `${table}` 注入请求(通常就是 `body.api_name`):
+
+```yaml
+  financial:
+    batch: 1                 # 多标的共用一个请求时, 上游可能静默返回 0 行(见下)
+    response_path: data
+    table_map:               # 内部表名 → 上游接口名; 未声明的表视为「不支持」直接跳过
+      metrics: fina_indicator
+      income: income
+      balance_sheet: balancesheet
+      cash_flow: cashflow
+    body:
+      api_name: "${table}"   # 渲染为上面的上游接口名
+      fields: "ts_code,end_date,ann_date,..."
+      params:
+        ts_code: "${symbols}"
+    field_map: { ... }        # 一份映射覆盖各表(列不冲突即可)
+    transforms: { ... }
+```
+
+内部表与必需列(与内置财务表的落盘契约一致):
+
+| 内部表 | 必需列 |
+| --- | --- |
+| `metrics` | `symbol`、`period_end`、`announce_date` + 因子用指标(`bps`/`roe`/`gross_margin`/`net_margin`/`revenue_yoy`/`net_income_yoy`/`debt_to_asset_ratio` 等) |
+| `income` / `balance_sheet` / `cash_flow` | `symbol`、`period_end`、`announce_date` + 各表 canonical 列(canonical 名见 `plugins/fuyao/provider.py` 的字段表) |
+| `shares` | `symbol`、`period_end`、`float_shares`(单位: 股) |
+
+口径与单位(上游不同接口常不一致, 必须在 `transforms` 里统一):
+
+- **金额 → 元**(如千元/万元乘系数); 内部财务金额一律以元落盘。
+- **比率 → 百分数**(ROE 34.19 表示 34.19%), 与 `factors/registry.py` 的中文口径一致; 小数制需 `value * 100`。
+- **股本 → 股**: Tushare `daily_basic.float_share` 是万股, 需 `value * 10000`。
+- 同一来源在两张表里同名不同单位时**不要映射**(如 `total_share` 在 `balancesheet` 是股、在
+  `daily_basic` 是万股), 否则后映射的会覆盖先映射的值。
+
+其它工程约束(均经实测, 踩过就记在这里):
+
+- `(symbol, period_end)` 在同一批返回里**唯一**: 上游可能对同一报告期返回完全重复的行, 本项目在
+  合并后按 `announce_date` 去重保留最新一行。
+- 单请求行数上限: 上游常按接口限行(如 Tushare `income` 一次最多 100+ 期、`balancesheet` 100 期),
+  超出部分不会自动翻页 —— 需要更长历史时只能按标的拆请求。
+- `batch` 不一定是越大越好: 部分接口**不支持多标的**(逗号串静默返回 0 行), 这类数据集应 `batch: 1`。
+- 声明了 `table_map` 时它就是支持范围: 内部会调用 `shares` 等未声明的表时直接跳过(返回空表,
+  已有落盘数据保留), 不会向上游发无效请求。
+
 ### 完整示例: Tushare(纯 YAML 接入)
 
-仓内 `docs/examples/tushare.yaml` 是可直接复用的完整配置(日K / 除权因子 / 分钟K 三个数据集),
+仓内 `docs/examples/tushare.yaml` 是可直接复用的完整配置(日K / 除权因子 / 分钟K / 财务四表),
 拷到 `data/data_sources/` 并在 `.env` 配 `TUSHARE_API_KEY` 即可:
 
 ```yaml
@@ -286,14 +335,24 @@ datasets:
   minute:
     # ...同构: body.api_name=stk_mins, params.freq=1min,
     # 时间参数用 ${start:%Y-%m-%d %H:%M:%S}, transforms 里 volume: "value / 100"(股→手)
+  financial:
+    # ...同构: table_map 把 4 张内部表映射到 fina_indicator/income/balancesheet/cashflow,
+    # body.api_name="${table}", 比率保持百分数、金额保持元、股本万股→股
 ```
 
 覆盖范围与注意: 日K仅 A 股(`daily`)——ETF/指数日K需换 `fund_daily`/`index_daily` 接口, 而一个数据集
 只能有一个 url/body 模板, 故这两个数据集的日K请路由到 TickFlow(或另写一个插件);
 分钟K(`stk_mins`)对股票/ETF/指数通用。
+财务只覆盖**内部真实消费**的 4 张表(`metrics`/`income`/`balance_sheet`/`cash_flow`);
+上游另外那些接口(业绩预告/快报、分红送股、审计意见、主营构成、披露计划等)与本项目数据模型
+**没有下游消费方**: 没有对应数据集、服务、因子或页面, 接进来也只会落一堆无人读的 parquet。
+需要它们时先加内部表契约与消费方(因子/页面), 再在 `table_map` 里加一行映射。
+历史股本(`shares`)同样默认不开: 上游只有按交易日的股本(单标的数千行), 默认全 A 同步代价过高;
+需要时给 `table_map` 加 `shares: daily_basic` 一行即可(YAML 已备好 `trade_date`→`period_end`、
+`float_share`(万股)→`float_shares`(股))。
 
-> `body` / `params` / `adj_factor_mode` 没有设置页表单控件, 但会在配置回填与保存时**原样保留**;
-> 修改这三项请直接编辑 `data/data_sources/*.yaml` 后点「重新加载」。
+> `body` / `params` / `table_map` / `adj_factor_mode` 没有设置页表单控件, 但会在配置回填与保存时
+> **原样保留**; 修改这几项请直接编辑 `data/data_sources/*.yaml` 后点「重新加载」。
 
 ## 鉴权
 
