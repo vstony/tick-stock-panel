@@ -6,6 +6,7 @@ import { EmptyState } from '@/components/EmptyState'
 import { useCapabilities, useCapabilityMatrix } from '@/lib/useSharedQueries'
 import { routeCapUsable } from '@/lib/capability-labels'
 import { useFinancialStatus, useFinancialSync } from '@/lib/useFinancials'
+import { FULL_SYNC_HINT, financialSyncBannerText } from '@/lib/financialSyncBanner'
 import { StockFinancialSearch } from '@/components/financials/StockFinancialSearch'
 import { StockFinancialDetail } from '@/components/financials/StockFinancialDetail'
 import { ReportHistoryPanel } from '@/components/financials/ReportHistoryPanel'
@@ -176,10 +177,20 @@ export function Financials() {
           <div className="flex items-center gap-2">
             <LastStockChip stock={lastStock} onSelect={pick} />
             {syncing && (
-              <span className="text-xs text-accent/80 flex items-center gap-1.5">
+              <span
+                className="text-xs text-accent/80 flex items-center gap-1.5"
+                title={isFullSync ? FULL_SYNC_HINT : undefined}
+              >
                 <Loader2 className="w-3 h-3 animate-spin" />
                 {isFullSync
-                  ? `已同步 ${syncedCount}/${TABLE_ORDER.length} 张表…`
+                  ? financialSyncBannerText({
+                      synced: syncedCount,
+                      total: TABLE_ORDER.length,
+                      tableLabel: currentSyncingTable
+                        ? (TABLE_LABELS[currentSyncingTable] ?? currentSyncingTable)
+                        : null,
+                      elapsedMs: syncStartedAt ? Date.now() - syncStartedAt : 0,
+                    })
                   : isSingleSync
                     ? `同步${TABLE_LABELS[syncSingleTable!] ?? syncSingleTable}…`
                     : '同步中…'}
