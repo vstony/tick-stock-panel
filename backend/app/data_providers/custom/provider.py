@@ -167,7 +167,7 @@ class GenericHTTPProvider:
                 return self._request_rows(
                     cfg, symbols=symbols, start_time=start_time, end_time=end_time
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 last = e
                 if attempt < retries:
                     time.sleep(1.0 * (attempt + 1))
@@ -179,7 +179,7 @@ class GenericHTTPProvider:
         symbols: list[str],
         start_time: datetime | None,
         end_time: datetime | None,
-        asset_type: str = "stock",  # noqa: ARG002
+        asset_type: str = "stock",
         on_chunk_done=None,
     ) -> pl.DataFrame:
         cfg = self._dataset("daily")
@@ -192,7 +192,7 @@ class GenericHTTPProvider:
                 rows = self._request_rows_retry(
                     cfg, chunk, start_time=start_time, end_time=end_time
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 # 单批失败只隔离该批 (#226): 之前任一批 502 会让整个 stage
                 # 抛异常, 已成功批次的结果留在内存里全部丢弃
                 failed.extend(chunk)
@@ -221,7 +221,7 @@ class GenericHTTPProvider:
         symbols: list[str],
         start_time: datetime | None,
         end_time: datetime | None,
-        asset_type: str = "stock",  # noqa: ARG002
+        asset_type: str = "stock",
         on_chunk_done=None,
     ) -> pl.DataFrame:
         cfg = self._dataset("adj_factor")
@@ -244,7 +244,7 @@ class GenericHTTPProvider:
                 rows = self._request_rows_retry(
                     cfg, chunk, start_time=fetch_start, end_time=end_time
                 )
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 failed.extend(chunk)
                 logger.warning(
                     "custom adj_factor: batch %d/%d failed (%d symbols), skipped: %s",
@@ -313,7 +313,7 @@ class GenericHTTPProvider:
     def get_intraday_batch(
         self,
         symbols: list[str],
-        count: int = 300,  # noqa: ARG002 — 与插件契约对齐, YAML 源按时间窗口取全天
+        count: int = 300,
         asset_type: AssetType = "stock",
     ) -> pl.DataFrame:
         """全量分钟修复轮: 按当日窗口批量拉取 full_minute 数据集 (chunked + rpm 限速)。
@@ -457,7 +457,7 @@ class GenericHTTPProvider:
                     s.str.to_datetime(strict=False, format=fmt)
                     if fmt else s.str.to_datetime(strict=False)
                 )
-            except Exception:  # noqa: BLE001 — 该格式不适用, 换下一个
+            except Exception:
                 continue
         return pl.Series("datetime", [None] * s.len(), dtype=pl.Datetime("us"))
 
@@ -635,6 +635,6 @@ def _token_from_env(name: str | None) -> str | None:
             key, value = text.split("=", 1)
             if key.strip() == name:
                 return value.strip().strip('"').strip("'")
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
     return None
