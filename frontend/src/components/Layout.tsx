@@ -65,6 +65,7 @@ import { resolveWatchlistGroupColor } from '@/lib/watchlist-group-colors'
 import { computeGroupPcts, groupPctColor, groupPctTitle } from '@/lib/watchlistGroupStats'
 import { fmtPct } from '@/lib/format'
 import { findDataSource } from '@/lib/dataSources'
+import { unavailableCapabilityHint } from '@/lib/capabilityHint'
 import { toggleTheme, useTheme } from '@/lib/theme'
 import { setCurrentTotal as setAlertTotal, useUnreadAlerts } from '@/lib/monitorBadge'
 import { ExtensionSlot } from '@/extensions/ExtensionSlot'
@@ -286,22 +287,31 @@ function DataSourceHealthBadge({ matrix }: { matrix: CapabilityMatrix | undefine
             <div className="space-y-1.5 border-t border-border/60 pt-2">
               {loading ? (
                 <div className="py-0.5 text-[11px] text-muted">正在获取能力路由状态…</div>
-              ) : caps.map(c => (
-                <div key={c.id} className="flex min-w-0 items-center gap-2">
-                  <span className={`h-2 w-2 shrink-0 rounded-[2px] ${capSquareCls(c)}`} />
-                  <span className="shrink-0 text-xs font-medium text-secondary">{c.label}</span>
-                  <span className="ml-auto flex min-w-0 shrink items-center gap-1.5">
-                    {c.usable ? (
-                      <>
-                        <span className="truncate text-[11px] text-muted">{c.effective_display}</span>
-                        <CheckCircle2 className="h-3 w-3 shrink-0 text-accent" />
-                      </>
-                    ) : (
-                      <span className="text-[11px] text-muted/70">未接入</span>
-                    )}
-                  </span>
-                </div>
-              ))}
+              ) : caps.map(c => {
+                // 未接入细分: 有候选源 = 只是没切路由(一步可修), 无候选 = 真没源能提供
+                const hint = c.usable ? null : unavailableCapabilityHint(c)
+                return (
+                  <div key={c.id} className="flex min-w-0 items-center gap-2">
+                    <span className={`h-2 w-2 shrink-0 rounded-[2px] ${capSquareCls(c)}`} />
+                    <span className="shrink-0 text-xs font-medium text-secondary">{c.label}</span>
+                    <span className="ml-auto flex min-w-0 shrink items-center gap-1.5">
+                      {hint === null ? (
+                        <>
+                          <span className="truncate text-[11px] text-muted">{c.effective_display}</span>
+                          <CheckCircle2 className="h-3 w-3 shrink-0 text-accent" />
+                        </>
+                      ) : (
+                        <span
+                          className={`truncate text-[11px] ${hint.tone === 'warn' ? 'text-warning/90' : 'text-muted/70'}`}
+                          title={hint.title}
+                        >
+                          {hint.text}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                )
+              })}
             </div>
             {/* 分时有分钟K功能替身 (intraday_monitor_support 三路可达), 不单独占能力格, 在此备注 */}
             <div className="mt-1.5 text-[10px] leading-relaxed text-muted/70">
