@@ -14,6 +14,7 @@ import yaml
 from app import secrets_store
 from app.config import settings
 from app.data_providers.custom.config import (
+    ADJ_FACTOR_MODES,
     DEFAULT_TIMEOUT,
     MAX_TIMEOUT,
     CustomSourceConfig,
@@ -361,6 +362,11 @@ def _config_to_dict(config: CustomSourceConfig) -> dict:
             "response_path": ds.response_path,
             "field_map": dict(ds.field_map),
             **({"transforms": dict(ds.transforms)} if ds.transforms else {}),
+            # 请求体/静态参数/因子口径: 设置页表单没有对应控件, 但必须原样回填与回写,
+            # 否则用户在设置页保存一次就会静默丢掉这些字段(tushare 这类协议完全依赖它们)
+            **({"body": dict(ds.body)} if ds.body else {}),
+            **({"params": dict(ds.params)} if ds.params else {}),
+            **({"adj_factor_mode": ds.adj_factor_mode} if ds.adj_factor_mode != "single" else {}),
             **({
                 "symbols_param": ds.symbols_param,
                 "start_param": ds.start_param,
@@ -467,7 +473,20 @@ def _sanitize_dataset(ds_name: str, ds_cfg: dict) -> dict:
             )
         if timeout != DEFAULT_TIMEOUT:
             out["timeout"] = timeout
-    out["response_path"] = str(ds_cfg.get("response_path", "") or "")
+    response_path = str(ds_cfg.get("response_path", "") or "")
+    out["response_path"] = response_path
+    body = ds_cfg.get("body")
+    if body is not None:
+        if not isinstance(body, dict):
+            raise ValueError(f"{ds_name}: body 必须是对象")
+        if body:
+            out["body"] = body
+    static_params = ds_cfg.get("params")
+    if static_params is not None:
+        if not isinstance(static_params, dict):
+            raise ValueError(f"{ds_name}: params 必须是对象")
+        if static_params:
+            out["params"] = static_params
     field_map = {
         str(k): str(v)
         for k, v in (ds_cfg.get("field_map") or {}).items()
@@ -506,6 +525,15 @@ def _sanitize_dataset(ds_name: str, ds_cfg: dict) -> dict:
             out["asset_type_param"] = asset_type_param
         if freq_param:
             out["freq_param"] = freq_param
+    adj_mode = str(ds_cfg.get("adj_factor_mode") or "").strip().lower()
+    if adj_mode and adj_mode != "single":
+        if ds_name != "adj_factor":
+            raise ValueError(f"{ds_name}: adj_factor_mode 仅用于 adj_factor 数据集")
+        if adj_mode not in ADJ_FACTOR_MODES:
+            raise ValueError(
+                f"{ds_name}: adj_factor_mode 必须是 {' 或 '.join(ADJ_FACTOR_MODES)}"
+            )
+        out["adj_factor_mode"] = adj_mode
     request_params = [
         out.get("symbols_param", "symbols"),
         out.get("start_param", "start_time"),

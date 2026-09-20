@@ -449,6 +449,11 @@ class DatasetConfigIn(BaseModel):
     response_path: str = ""
     field_map: dict[str, str] = {}
     transforms: dict[str, str] = {}
+    # 设置页表单没有 body/params/adj_factor_mode 控件, 但仍需接受并回存:
+    # 否则用户在设置页保存一次, 这类协议字段(YAML 侧手写)会被静默丢弃。
+    body: dict = {}
+    params: dict = {}
+    adj_factor_mode: str | None = None
     symbols_param: str = "symbols"
     start_param: str = "start_time"
     end_param: str = "end_time"

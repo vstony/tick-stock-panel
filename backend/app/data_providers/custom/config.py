@@ -10,6 +10,9 @@ import yaml
 DatasetName = Literal["daily", "adj_factor", "realtime", "minute", "financial"]
 DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 300.0
+# 复权因子口径: single = 上游直接给单事件比值(默认); cumulative = 上游给累积因子,
+# 本项目按 adj(D)/adj(D-1) 换算成单事件比值(见 normalizer.cumulative_adj_factors_to_events)。
+ADJ_FACTOR_MODES = ("single", "cumulative")
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,8 @@ class DatasetConfig:
     # realtime 比例字段(change_pct/amplitude/turnover_rate)的单位声明:
     # "percent"(返回 3.66 表示 3.66%)或 "decimal"(返回 0.0366 表示 3.66%)。
     pct_unit: str | None = None
+    # adj_factor 专用: 上游因子是单事件比值还是累积值(默认 single)。
+    adj_factor_mode: str = "single"
 
 
 @dataclass(frozen=True)
@@ -82,6 +87,12 @@ def _dataset_from_dict(raw: dict[str, Any]) -> DatasetConfig:
     if pct_unit not in (None, "percent", "decimal"):
         raise ValueError(f"pct_unit must be 'percent' or 'decimal', got {pct_unit!r}")
 
+    adj_mode = str(raw.get("adj_factor_mode") or "single").strip().lower() or "single"
+    if adj_mode not in ADJ_FACTOR_MODES:
+        raise ValueError(
+            f"adj_factor_mode must be one of {', '.join(ADJ_FACTOR_MODES)}, got {adj_mode!r}"
+        )
+
     return DatasetConfig(
         url=str(raw.get("url", "") or ""),
         method=str(raw.get("method", "GET") or "GET").upper(),
@@ -99,6 +110,7 @@ def _dataset_from_dict(raw: dict[str, Any]) -> DatasetConfig:
         asset_type_param=(str(raw.get("asset_type_param") or "").strip() or None),
         freq_param=(str(raw.get("freq_param") or "").strip() or None),
         pct_unit=pct_unit,
+        adj_factor_mode=adj_mode,
     )
 
 

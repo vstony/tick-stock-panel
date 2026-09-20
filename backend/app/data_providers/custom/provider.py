@@ -14,14 +14,20 @@ import polars as pl
 
 from app.config import settings
 from app.data_providers.base import AssetType
+from app.data_providers.custom import template
 from app.data_providers.custom.config import CustomSourceConfig, DatasetConfig
 from app.data_providers.custom.mapper import (
     apply_transforms,
     datetime_payload,
     extract_rows,
     map_rows,
+    payload_error,
 )
-from app.data_providers.normalizer import normalize_adj_factors, normalize_daily
+from app.data_providers.normalizer import (
+    cumulative_adj_factors_to_events,
+    normalize_adj_factors,
+    normalize_daily,
+)
 from app.market_time import cn_now
 from app.tickflow.rate_limits import chunked, sleep_between_batches
 
@@ -37,6 +43,10 @@ _REQUIRED = {
     # financial 字段由数据源决定, 只要求能映射出 symbol
     "financial": {"symbol"},
 }
+
+# 累积复权因子换算成单事件比值需要"前一交易日"的因子: 取数窗口向前多取一段回看,
+# 换算后再裁回调用方请求的窗口(否则窗口首个除权日会丢)。
+_ADJ_LOOKBACK_DAYS = 40
 
 # 小数制下 change_pct 的物理上限: A股最大涨跌停 30% (+容差)。
 # 中位数口径下小数制批次不可能超过该值, 百分制批次(典型中位数 0.5~3)必然超过。
@@ -132,6 +142,16 @@ class GenericHTTPProvider:
                         f"{dataset}: duplicate request parameter names: "
                         f"{', '.join(duplicates)}"
                     )
+        if self.config.auth.type == "body":
+            non_post = sorted(
+                name for name, cfg in self.config.datasets.items()
+                if cfg.method.upper() != "POST"
+            )
+            if non_post:
+                errors.append(
+                    "auth.type=body 只在 POST 请求体里有位置, "
+                    f"以下数据集不是 POST: {', '.join(non_post)}"
+                )
         return errors
 
     def _request_rows_retry(
@@ -202,6 +222,16 @@ class GenericHTTPProvider:
         on_chunk_done=None,
     ) -> pl.DataFrame:
         cfg = self._dataset("adj_factor")
+        # adj_factor_mode=cumulative: 上游给累积因子, 本项目换算为单事件比值。
+        # 换算需要前一交易日的因子 → 取数窗口向前多取一段, 换算后裁回请求窗口。
+        cumulative = cfg.adj_factor_mode == "cumulative"
+        fetch_start = (
+            start_time - timedelta(days=_ADJ_LOOKBACK_DAYS)
+            if cumulative and start_time
+            else start_time
+        )
+        window_start = start_time.date() if (cumulative and start_time) else None
+        window_end = end_time.date() if (cumulative and end_time) else None
         frames: list[pl.DataFrame] = []
         chunks = chunked(symbols, cfg.batch)
         failed: list[str] = []
@@ -209,7 +239,7 @@ class GenericHTTPProvider:
             sleep_between_batches(i, cfg.rpm)
             try:
                 rows = self._request_rows_retry(
-                    cfg, chunk, start_time=start_time, end_time=end_time
+                    cfg, chunk, start_time=fetch_start, end_time=end_time
                 )
             except Exception as e:  # noqa: BLE001
                 failed.extend(chunk)
@@ -222,6 +252,15 @@ class GenericHTTPProvider:
                 continue
             df = self._mapped_frame(cfg, rows)
             df = normalize_adj_factors(df, source=self.name)
+            if cumulative and not df.is_empty():
+                before = df.height
+                df = cumulative_adj_factors_to_events(
+                    df, start=window_start, end=window_end
+                )
+                logger.info(
+                    "custom adj_factor: 累积因子 %d 行 → 单事件比值 %d 条 (窗口 %s..%s)",
+                    before, df.height, window_start, window_end,
+                )
             if not df.is_empty():
                 frames.append(df)
             if on_chunk_done:
@@ -311,6 +350,7 @@ class GenericHTTPProvider:
             rows = self._request_rows(
                 cfg, symbols=chunk, start_time=start_time, end_time=end_time,
                 override_params=override or None, override_body=override or None,
+                template_context={"asset_type": asset_type, "freq": freq},
             )
             df = self._mapped_frame(cfg, rows)
             df = self._normalize_minute(df)
@@ -345,6 +385,7 @@ class GenericHTTPProvider:
             rows = self._request_rows(
                 cfg, symbols=chunk,
                 override_params=extra_params, override_body=extra_body,
+                template_context={"table": table},
             )
             df = self._mapped_frame(cfg, rows)
             if not df.is_empty():
@@ -440,6 +481,15 @@ class GenericHTTPProvider:
 
     def _mapped_frame(self, cfg: DatasetConfig, rows: list[dict]) -> pl.DataFrame:
         df = map_rows(rows, cfg.field_map)
+        if rows and df.is_empty():
+            # 响应有内容但一个字段都对不上: 绝不能静默当空数据(否则用户只看到 0 行)
+            logger.warning(
+                "自定义源 %s: 上游返回 %d 条记录但无任何字段可映射, "
+                "请核对 response_path/field_map 与上游字段名(响应字段样例: %s)",
+                self.name,
+                len(rows),
+                sorted(rows[0].keys())[:12],
+            )
         return apply_transforms(df, cfg.transforms)
 
     def _request_rows(
@@ -451,26 +501,44 @@ class GenericHTTPProvider:
         end_time: datetime | None = None,
         override_params: dict[str, Any] | None = None,
         override_body: dict[str, Any] | None = None,
+        template_context: dict[str, Any] | None = None,
     ) -> list[dict]:
         headers, auth_params = self._auth_parts()
+        # 声明了占位符的数据集: 请求参数完全由 body/params 模板描述, 不再做默认注入
+        # (注入的标的列表会破坏「嵌套 params + 逗号串」这类协议, 如 Tushare)
+        use_template = template.has_placeholder(cfg.params) or template.has_placeholder(cfg.body)
         params = dict(cfg.params)
         params.update(auth_params)
-        if override_params:
-            params.update(override_params)
         body = dict(cfg.body)
-        if override_body:
-            body.update(override_body)
-        if symbols:
-            body[cfg.symbols_param] = symbols
-            params.setdefault(cfg.symbols_param, ",".join(symbols))
-        start_value = datetime_payload(start_time)
-        end_value = datetime_payload(end_time)
-        if start_value:
-            body[cfg.start_param] = start_value
-            params.setdefault(cfg.start_param, start_value)
-        if end_value:
-            body[cfg.end_param] = end_value
-            params.setdefault(cfg.end_param, end_value)
+        if use_template:
+            context: dict[str, Any] = {
+                "symbols": ",".join(symbols or []),
+                "start": start_time,
+                "end": end_time,
+                "table": None,
+                "asset_type": None,
+                "freq": None,
+                **(template_context or {}),
+            }
+            params = template.render(params, context)
+            body = template.render(body, context)
+        else:
+            if override_params:
+                params.update(override_params)
+            if override_body:
+                body.update(override_body)
+            if symbols:
+                body[cfg.symbols_param] = symbols
+                params.setdefault(cfg.symbols_param, ",".join(symbols))
+            start_value = datetime_payload(start_time)
+            end_value = datetime_payload(end_time)
+            if start_value:
+                body[cfg.start_param] = start_value
+                params.setdefault(cfg.start_param, start_value)
+            if end_value:
+                body[cfg.end_param] = end_value
+                params.setdefault(cfg.end_param, end_value)
+        body.update(self._body_auth())
 
         method = cfg.method.upper()
         request_kwargs: dict[str, Any] = {"headers": headers, "timeout": cfg.timeout}
@@ -481,7 +549,28 @@ class GenericHTTPProvider:
             request_kwargs["json"] = body
         resp = self._client.request(method, cfg.url, **request_kwargs)
         resp.raise_for_status()
-        return extract_rows(resp.json(), cfg.response_path)
+        payload = resp.json()
+        rows = extract_rows(payload, cfg.response_path)
+        if not rows:
+            # 上游把业务错误放在 200 响应里(code/msg)时, 不能静默当"无数据"
+            err = payload_error(payload)
+            if err:
+                logger.warning(
+                    "自定义源 %s 上游返回业务错误(HTTP %s): %s",
+                    self.name, resp.status_code, err,
+                )
+        return rows
+
+    def _body_auth(self) -> dict[str, str]:
+        """auth.type=body: 把 Token 注入 POST 请求体(参数名 auth.param)。"""
+        auth = self.config.auth
+        if auth.type != "body":
+            return {}
+        token = _token_from_env(auth.token_env) if auth.token_env else None
+        if not token:
+            logger.warning("custom data source %s auth token is not set", self.name)
+            return {}
+        return {auth.param or "token": token}
 
     def _auth_parts(self) -> tuple[dict[str, str], dict[str, str]]:
         auth = self.config.auth
