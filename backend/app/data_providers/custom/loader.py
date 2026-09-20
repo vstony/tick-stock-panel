@@ -16,6 +16,7 @@ from app import secrets_store
 from app.config import settings
 from app.data_providers.custom.config import (
     ADJ_FACTOR_MODES,
+    DECLARABLE_DATASETS,
     DEFAULT_TIMEOUT,
     MAX_TIMEOUT,
     CustomSourceConfig,
@@ -432,7 +433,7 @@ def _sanitize_for_yaml(config: dict) -> dict:
 
     datasets_out: dict = {}
     for ds_name, ds_cfg in (config.get("datasets") or {}).items():
-        if ds_name not in {"daily", "adj_factor", "realtime", "minute", "full_minute", "financial"}:
+        if ds_name not in DECLARABLE_DATASETS:
             continue
         if not isinstance(ds_cfg, dict):
             continue

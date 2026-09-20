@@ -1,13 +1,22 @@
 """Custom HTTP data source configuration."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
 
-DatasetName = Literal["daily", "adj_factor", "realtime", "minute", "financial"]
+logger = logging.getLogger(__name__)
+
+DatasetName = Literal["daily", "adj_factor", "realtime", "minute", "full_minute", "financial"]
+# 声明式支持的数据集: 与 loader._sanitize_dataset、provider._REQUIRED 以及
+# 前端 DataSourceEditor 的 DATASETS 必须同集 —— 漏一个就会在 YAML 加载时被静默丢弃
+# (踩过: full_minute 长期缺在此集合里, 声明了也不生效, 源无法被路由为全量分钟)。
+DECLARABLE_DATASETS = frozenset({
+    "daily", "adj_factor", "realtime", "minute", "full_minute", "financial",
+})
 DEFAULT_TIMEOUT = 30.0
 MAX_TIMEOUT = 300.0
 # 复权因子口径: single = 上游直接给单事件比值(默认); cumulative = 上游给累积因子,
@@ -130,10 +139,24 @@ def _dataset_from_dict(raw: dict[str, Any]) -> DatasetConfig:
 
 
 def config_from_dict(raw: dict[str, Any], path: Path | None = None) -> CustomSourceConfig:
+    declared = raw.get("datasets") or {}
+    unknown = sorted(
+        name for name, cfg in declared.items()
+        if isinstance(cfg, dict) and name not in DECLARABLE_DATASETS
+    )
+    if unknown:
+        # 静默丢弃会让用户以为"数据集已声明"但路由里根本不存在(拼错 full_minute 这类),
+        # 必须留一条可定位的告警。
+        logger.warning(
+            "自定义源 %s: 忽略不支持的数据集 %s(支持: %s)",
+            raw.get("name") or (path.stem if path else "preview"),
+            ", ".join(unknown),
+            ", ".join(sorted(DECLARABLE_DATASETS)),
+        )
     datasets = {
         name: _dataset_from_dict(cfg)
-        for name, cfg in (raw.get("datasets") or {}).items()
-        if name in {"daily", "adj_factor", "realtime", "minute", "financial"} and isinstance(cfg, dict)
+        for name, cfg in declared.items()
+        if name in DECLARABLE_DATASETS and isinstance(cfg, dict)
     }
     default_name = path.stem if path else "preview"
     name = str(raw.get("name", default_name) or default_name).lower()
