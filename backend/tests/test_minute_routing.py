@@ -675,11 +675,15 @@ def _make_minute_config(**extra) -> CustomSourceConfig:
 
 
 def _capture_request_rows(provider):
-    """替换 _request_rows 为捕获 spy, 返回 captured dict。"""
+    """替换 _request_rows 为捕获 spy, 返回 captured dict。
+
+    **kwargs 吸收调用方后续新增的上下文参数(如 template_context), spy 只关心
+    override_params / override_body 是否按配置注入。
+    """
     captured: dict = {}
 
     def fake_request_rows(cfg, *, symbols=None, start_time=None, end_time=None,
-                          override_params=None, override_body=None):
+                          override_params=None, override_body=None, **_kwargs):
         captured["override_params"] = override_params
         captured["override_body"] = override_body
         return []  # 空行 → 空 df
