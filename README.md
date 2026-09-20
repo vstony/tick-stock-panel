@@ -545,7 +545,7 @@ PORT=3018                      # 服务端口
 
 内置数据源插件 [fuyao](https://fuyao.aicubes.cn/docs/api-reference/) 提供同花顺 REST 数据接口(行情 / 财务 / 龙虎榜 / 盘前风向标 / 交易日历等),需自备 API Key,使用前请遵守其服务条款
 
-内置数据源插件 [Tushare Pro](https://tushare.pro) 提供 A 股 / ETF / 指数日K、除权因子、分钟K 与标的维表(接口按积分等级限频),需自备 API Key,使用前请遵守其服务条款
+数据源示例 [Tushare Pro](https://tushare.pro) 以纯 YAML 自定义源接入(A 股日K / 除权因子 / 分钟K,见 [docs/examples/tushare.yaml](./docs/examples/tushare.yaml),接口按积分等级限频),需自备 API Key,使用前请遵守其服务条款
 
 数据源插件 [stock-sdk](https://stock-sdk.linkdiary.cn) 遵循其各自的 ISC 协议。
 
