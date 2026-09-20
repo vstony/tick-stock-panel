@@ -83,7 +83,14 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]
-ignore = ["E501"]   # 长行交给 fmt
+ignore = [
+    "E501",        # 长行交给 fmt
+    # 本仓库注释/文档串/提示文本一律中文, 全角标点(，。（）：「」)是有意排版, 不是同形字误用;
+    # 这三条规则面向英文代码库, 在中文语境下恒为误报(全仓 900+ 条, 会盖住真问题)。
+    "RUF001",     # ambiguous-unicode-character-string
+    "RUF002",     # ambiguous-unicode-character-docstring
+    "RUF003",     # ambiguous-unicode-character-comment
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
