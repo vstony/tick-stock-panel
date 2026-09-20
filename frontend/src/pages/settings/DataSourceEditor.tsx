@@ -567,6 +567,12 @@ function DatasetDetail({
                   <span className="text-accent font-medium">{test.data.rows}</span> 行
                   <span className="text-muted mx-1.5">·</span>
                   列: <span className="text-secondary">{test.data.columns.join(', ')}</span>
+                  {test.data.symbols?.length ? (
+                    <>
+                      <span className="text-muted mx-1.5">·</span>
+                      实际请求标的: <span className="text-secondary">{test.data.symbols.join(', ')}</span>
+                    </>
+                  ) : null}
                 </div>
               )}
               {test.isError && (

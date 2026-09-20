@@ -1761,6 +1761,8 @@ export interface DataSourceTestResult {
   rows: number
   columns: string[]
   preview: Record<string, unknown>[]
+  /** 实际发出去的标的(手工输入的 6 位代码会被后端归一成 600000.SH) */
+  symbols?: string[]
 }
 
 /** 插件 Key 保存结果 (先探后存: 无效 Key 返回 ok=false 且不落盘) */

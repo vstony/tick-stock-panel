@@ -770,6 +770,7 @@ def test_data_source(req: CustomSourceTestIn) -> dict:
 
     temporary = req.config is not None
     provider = None
+    symbols = _canonical_test_symbols(req.symbols)
     try:
         if req.config:
             config = req.config.model_dump()
@@ -780,12 +781,39 @@ def test_data_source(req: CustomSourceTestIn) -> dict:
             provider = custom_sources.create_provider(config)
         else:
             provider = custom_sources.get_provider(req.provider)
-        return provider.test_dataset(req.dataset, req.symbols)
+        result = provider.test_dataset(req.dataset, symbols)
+        if symbols is not None:
+            # 回显实际发出去的标的: 手工输入的 600000 会被归一成 600000.SH,
+            # 不告知用户就会以为"填的没错还是 0 行"。
+            result["symbols"] = symbols
+        return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"自定义数据源测试失败: {e}") from e
     finally:
         if temporary and provider is not None:
             provider.close()
+
+
+def _canonical_test_symbols(symbols: list[str] | None) -> list[str] | None:
+    """试拉测试的标的输入归一为规范格式(如 600000.SH)。
+
+    上游普遍只认「6 位代码.交易所大写后缀」: 实测 Tushare 对 600000 / sh600000 /
+    600000.XSHG 全部返回 0 行(不报错), 而手工试拉很容易只填 6 位代码。
+    优先查 instruments 维表(code → symbol), 查不到时 6 开头 → .SH、其余 → .SZ 兜底。
+    已带后缀的原样返回 —— 归一只是补齐交易所, 不改变用户意图。
+    """
+    if not symbols:
+        return symbols
+    import polars as pl
+
+    from app.config import settings
+    from app.services import ext_data
+
+    cleaned = [str(item).strip() for item in symbols if str(item).strip()]
+    if not cleaned:
+        return symbols
+    lookup = ext_data.build_code_lookup(settings.data_dir)
+    return ext_data.normalize_symbol(pl.Series("symbol", cleaned), lookup).to_list()
 
 
 @router.put("/preferences/data-providers")

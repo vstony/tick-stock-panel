@@ -56,6 +56,10 @@ _PCT_FRACTION_MAX = 0.31
 
 _PCT_COLUMNS = ("change_pct", "amplitude", "turnover_rate")
 
+# 内部全链路(落盘 / JOIN / 策略)约定的标的格式: 6 位代码.两位交易所大写
+# (如 600000.SH / 000001.SZ / 920002.BJ)。
+_CANONICAL_SYMBOL_PATTERN = r"^\d{6}\.[A-Z]{2}$"
+
 
 def _normalize_pct_units(
     df: pl.DataFrame,
@@ -518,7 +522,31 @@ class GenericHTTPProvider:
                 len(rows),
                 sorted(rows[0].keys())[:12],
             )
-        return apply_transforms(df, cfg.transforms)
+        df = apply_transforms(df, cfg.transforms)
+        self._warn_on_odd_symbols(df)
+        return df
+
+    def _warn_on_odd_symbols(self, df: pl.DataFrame) -> None:
+        """symbol 不是 `600000.SH` 规范格式时告警。
+
+        上游普遍只认「代码.交易所(大写后缀)」: 实测 Tushare 对 600000 / sh600000 /
+        600000.XSHG / 600000.sz 全部返回 code=0 但 **0 行**(静默无数据, 不报错), 而内部
+        落盘与 JOIN 也按该格式对齐 —— 值不对时给一条可定位的告警, 不让"0 行"无从查起。
+        """
+        if df.is_empty() or "symbol" not in df.columns:
+            return
+        values = df.get_column("symbol").cast(pl.Utf8, strict=False).drop_nulls()
+        if values.is_empty():
+            return
+        odd = values.filter(~values.str.contains(_CANONICAL_SYMBOL_PATTERN)).unique()
+        if odd.is_empty():
+            return
+        logger.warning(
+            "自定义源 %s: symbol 不是「600000.SH」规范格式(示例: %s) —— 上游通常只接受"
+            "「6 位代码.交易所大写后缀」, 其他写法会返回 0 行; 请核对传入标的与 field_map 的 symbol 映射",
+            self.name,
+            ", ".join(odd.head(3).to_list()),
+        )
 
     def _request_rows(
         self,
