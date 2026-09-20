@@ -23,6 +23,9 @@
 #     无配额报错(36s), rpm=240 下一轮 ≈ 70s, 与服务的仅修复轮节奏下限(60s)匹配;
 #   - 财务接口: income/balancesheet/cashflow/daily_basic **不支持多标的**(逗号串静默 0 行),
 #     fina_indicator 可以; 且部分接口单次约 100 期上限(≈25 年季报, 足够回测用)。
+#   - ts_code 只认「6 位代码.交易所大写后缀」(600000.SH / 000001.SZ / 920002.BJ):
+#     600000 / sh600000 / 600000.XSHG / 600000.sz 实测均返回 code=0 但 0 行(静默无数据)。
+#     内部 symbol 已是该格式, ${symbols} 直接逗号拼接即可。
 
 name: tushare_api
 display_name: "Tushare (HTTP 自定义源)"
@@ -147,7 +150,9 @@ datasets:
     url: http://api.tushare.pro
     method: POST
     batch: 1             # income/balancesheet/cashflow/daily_basic 不支持多标的(实测逗号串 0 行)
-    rpm: 240
+    rpm: 400             # 实测各财务接口配额 = 500 次/分钟(fina_indicator/income/balancesheet/cashflow
+                         # 均在 500~571 次时返回 code=40203 频率超限), 留 20% 余量。
+                         # batch=1 下 rate 即吞吐: 5568 只标的 ≈ 14 分钟/表(240 时是 32 分钟/表)
     timeout: 30
     response_path: data
     table_map:           # 内部表名 → Tushare 接口名(经 ${table} 注入 body.api_name)
