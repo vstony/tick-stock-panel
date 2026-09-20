@@ -30,6 +30,21 @@ def _frame(value: float = 10.0) -> pl.DataFrame:
     })
 
 
+def test_process_is_alive_classifies_missing_pid_as_dead() -> None:
+    """不存在的 pid 必须判死, 否则孤儿 publishing 标记永远无法自愈。
+
+    回归背景: Windows 下 ``os.kill(pid, 0)`` 对不存在的 pid 抛 OSError
+    (实测 winerror=11 ERROR_BAD_FORMAT, 不是代码假定的 87), 旧实现按"拿不准即存活"
+    兜底, 于是读取方与清库接口全部 fail-closed, 只能等下一次盘后管道接管。
+    """
+    from app.enriched_generation import _process_is_alive
+
+    assert _process_is_alive(999999999) is False
+    assert _process_is_alive(os.getpid()) is True
+    assert _process_is_alive(0) is False
+    assert _process_is_alive(None) is False
+
+
 def test_repository_enriched_noop_does_not_bump_generation(tmp_path) -> None:
     repo = KlineRepository(DataStore(tmp_path))
     frame = _frame()

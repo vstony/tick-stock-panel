@@ -128,20 +128,61 @@ def _exclusive_generation_lock(data_dir: Path, asset_type: str) -> Iterator[None
             _unlock_file(stream)
 
 
+# OpenProcess 权限: 只要 SYNCHRONIZE 就能等服务对象, 不要求 PROCESS_QUERY_INFORMATION。
+_SYNCHRONIZE = 0x00100000
+_WAIT_OBJECT_0 = 0x00000000
+_NT_ERROR_ACCESS_DENIED = 5
+_NT_ERROR_INVALID_PARAMETER = 87
+_NT_ERROR_NOT_FOUND = 1168
+
+
+def _windows_process_is_alive(pid: int) -> bool:
+    """Windows 下判定进程存活: OpenProcess(SYNCHRONIZE) + 0 秒等待。
+
+    不能用 ``os.kill(pid, 0)``: Windows 没有信号语义, 对不存在的 pid 抛的 winerror 随
+    pid 取值而异(实测 999999999 -> winerror=11 ERROR_BAD_FORMAT, 常见另一取值是 87
+    ERROR_INVALID_PARAMETER), 猜错误码就会把"已死"判成"存活", 僵死发布标记永远无法
+    自愈(读写双方都被 fail-closed 卡住)。这里只做两种确定判断, 其余保守按存活:
+
+    - 句柄拿不到 且错误码是 ERROR_INVALID_PARAMETER/ERROR_NOT_FOUND -> 进程不存在;
+    - 句柄拿不到 但错误码是 ERROR_ACCESS_DENIED -> 进程存在只是无权限;
+    - 句柄拿到了: 0 秒等待返回 WAIT_OBJECT_0 -> 已退出, WAIT_TIMEOUT -> 仍在运行。
+    """
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_bool, ctypes.c_uint32)
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+
+    handle = kernel32.OpenProcess(_SYNCHRONIZE, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == _NT_ERROR_ACCESS_DENIED:
+            return True
+        return error not in (_NT_ERROR_INVALID_PARAMETER, _NT_ERROR_NOT_FOUND)
+    try:
+        # WAIT_FAILED/其他意外值按存活处理: 宁可 fail-closed 也不放行可能半写的数据。
+        return kernel32.WaitForSingleObject(handle, 0) != _WAIT_OBJECT_0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _process_is_alive(pid: Any) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
     if pid == os.getpid():
         return True
+    if os.name == "nt":
+        return _windows_process_is_alive(pid)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except (OSError, PermissionError) as exc:
-        # Windows 对不存在的 pid 返回 WinError 87 (ERROR_INVALID_PARAMETER),
-        # 不会映射为 ProcessLookupError; 按存活处理会让孤儿发布锁永远无法恢复。
-        if getattr(exc, "winerror", None) == 87:
-            return False
+    except OSError:
+        # 存在但无权限(EPERM) 等无法确定的错误: 按存活处理(保守 fail-closed)。
         return True
     return True
 
