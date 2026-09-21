@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import queue
+import subprocess
+import sys
 import threading
 from datetime import date, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import polars as pl
@@ -502,6 +505,26 @@ def test_worker_accepts_delivered_result_when_child_exit_is_slow(monkeypatch, tm
     assert result["worker"]["worker_exit_forcibly"] is True
     assert result["worker"]["worker_exitcode"] == -15
     assert process.exitcode == -15
+
+
+def test_hard_exit_reports_requested_exit_code():
+    """worker 硬退出必须保真退出码。
+
+    回归背景: ``os._exit`` 在 Windows 上仍会跑 DLL_PROCESS_DETACH, 实测偶发在收尾期崩成
+    access violation(exitcode 3221225477 / 0xC0000005) —— 此时终态结果已落管、任务本身成功,
+    但退出码被污染, 会让 ``worker_exitcode`` 指标与断言误判任务失败。
+    """
+    backend_dir = Path(worker_module.__file__).resolve().parents[2]
+
+    proc = subprocess.run(
+        [sys.executable, "-c", "from app.backtest.worker import _hard_exit; _hard_exit(7)"],
+        cwd=backend_dir,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 7, proc.stderr
 
 
 def test_spawn_walkforward_skips_folds_before_available_matrix_data(tmp_path):

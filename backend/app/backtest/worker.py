@@ -1,11 +1,13 @@
 """Spawn-isolated strategy backtest and optimizer task runner."""
 from __future__ import annotations
 
+import ctypes
 import json
 import logging
 import multiprocessing as mp
 import os
 import queue
+import sys
 import threading
 import time
 import traceback
@@ -14,7 +16,7 @@ from contextlib import suppress
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import psutil
 
@@ -269,17 +271,44 @@ def _worker_entry(task: dict[str, Any], event_queue, cancel_event) -> None:
             "traceback": traceback.format_exc(),
         })
     finally:
-        if store is not None:
-            with suppress(Exception):
-                store.db.close()
-        # 终态消息已入队: 显式冲刷队列后立即退出。put 只是入队, 实际写管道的
-        # 是后台 feeder 线程, close+join_thread 保证消息完整落管 (否则父进程误判
-        # "exited without result"); 大数据量任务再跳过解释器 teardown (GC、DuckDB
-        # 线程 join、DLL 卸载), 否则收尾可达数十秒, 撞上父进程 10s 退出预算。
+        # 终态消息(结果或错误)已入队, 这里不再做**任何原生清理**: store 是内存 DuckDB
+        # (KlineRepository 只读 parquet 视图), 进程随后由 _hard_exit 强制结束, 没有需要
+        # 冲刷的状态; 而 close() 会 join 原生线程, 曾在「结果已送达」之后偶发崩成
+        # access violation(exitcode 0xC0000005), 把已成功的任务标成失败。
+        # 见 _hard_exit 注释与 tests/backtest/test_worker_process.py 的 exitcode 断言。
+        #
+        # 队列必须显式冲刷: put 只是入队, 实际写管道的是后台 feeder 线程,
+        # close+join_thread 保证消息完整落管 (否则父进程误判 "exited without result");
+        # 收尾不再跑解释器 teardown 与 Windows DLL detach, 否则可达数十秒,
+        # 撞上父进程 10s 退出预算。
         with suppress(Exception):
             event_queue.close()
             event_queue.join_thread()
-        os._exit(0)
+        _hard_exit(0)
+
+
+def _hard_exit(code: int) -> NoReturn:
+    """以固定退出码结束 worker 进程, 不跑解释器收尾与 Windows DLL detach。
+
+    ``os._exit`` 在 Windows 上最终走 ``ExitProcess``, 仍会通知每个 DLL ``DLL_PROCESS_DETACH``。
+    实测(全量测试套件偶发, 约 1/3 次文件级复跑): worker 已把终态 result 完整冲刷进管道、
+    父进程也收到了结果, 却拿到 ``exitcode=3221225477``(0xC0000005 STATUS_ACCESS_VIOLATION)
+    —— 崩在**收尾期**的原生库(DuckDB close / polars 线程池 / DLL detach)而非任务本身,
+    但 ``worker_exitcode`` 是指标与测试的硬断言, 会把这种收尾期崩溃当成任务失败, 掩盖真故障。
+
+    因此在终态消息 ``close()+join_thread()`` 冲洗完毕后: 先不再碰任何原生资源(见
+    ``_worker_entry`` 的 finally), 再直接 ``TerminateProcess`` 自身 —— 该调用不通知 DLL
+    detach, 退出码即传入值。
+    """
+    with suppress(Exception):
+        sys.stdout.flush()
+        sys.stderr.flush()
+    if sys.platform == "win32":
+        with suppress(Exception):
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.TerminateProcess(kernel32.GetCurrentProcess(), int(code))
+        # TerminateProcess 对当前进程不会返回; 真到了这里就走下面的 os._exit 兜底
+    os._exit(code)
 
 
 def run_worker_task(
