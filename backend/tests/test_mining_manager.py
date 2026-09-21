@@ -274,6 +274,40 @@ def test_runner_exception_marks_failed_and_appends_error_event(make_manager) -> 
     }
 
 
+def test_terminal_event_is_written_before_terminal_status(make_manager, monkeypatch) -> None:
+    """终态必须「先落事件, 再落状态」。
+
+    回归背景: 反序时读者以 manifest 状态判断任务已结束, 却可能还没看到对应事件 —— 实测
+    `test_runner_exception_marks_failed_and_appends_error_event` 偶发
+    `['queued', 'running'] != ['queued', 'running', 'error']`(全量套件下命中过)。
+    """
+    def runner(task, progress_cb, cancel_event):
+        raise RuntimeError("mining exploded")
+
+    manager = make_manager(runner)
+    store = manager.store
+    calls: list[str] = []
+    real_append = store.append_event
+    real_transition = store.transition_status
+
+    def recording_append(run_id, event_type, payload=None):
+        calls.append(f"event:{event_type}")
+        return real_append(run_id, event_type, payload)
+
+    def recording_transition(run_id, status, **kwargs):
+        calls.append(f"status:{status}")
+        return real_transition(run_id, status, **kwargs)
+
+    monkeypatch.setattr(store, "append_event", recording_append)
+    monkeypatch.setattr(store, "transition_status", recording_transition)
+
+    created = manager.start({"factor_names": ["size"]}, "data-v1")
+    _wait_for_status(manager, created["run_id"], "failed")
+
+    terminal = calls.index("status:failed")
+    assert "event:error" in calls[:terminal], calls
+
+
 def test_non_dict_worker_result_is_rejected(make_manager) -> None:
     def runner(task, progress_cb, cancel_event):
         return ["full", "result"]

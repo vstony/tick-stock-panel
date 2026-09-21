@@ -235,8 +235,9 @@ class MiningJobManager:
                 self._finish_cancelled_locked(run_id)
                 return
             self._store.write_summary(run_id, result)
-            self._store.transition_status(run_id, status)
+            # 与 _finish_failed 同理: 先落事件再落终态, 读者看到终态时事件必已存在
             self._store.append_event(run_id, status, {"status": status})
+            self._store.transition_status(run_id, status)
 
     def _finish_cancelled(self, run_id: str) -> None:
         with self._lock:
@@ -246,8 +247,9 @@ class MiningJobManager:
         manifest = self._store.get(run_id)
         if manifest is None or manifest["status"] in TERMINAL_RUN_STATUSES:
             return
-        self._store.transition_status(run_id, "cancelled")
+        # 先事件后状态(同上): 读者看到 cancelled 时 cancelled 事件必已存在
         self._store.append_event(run_id, "cancelled", {"status": "cancelled"})
+        self._store.transition_status(run_id, "cancelled")
 
     def _finish_failed(self, run_id: str, exc: Exception) -> None:
         message = str(exc)[:2000]
@@ -255,9 +257,12 @@ class MiningJobManager:
             manifest = self._store.get(run_id)
             if manifest is None or manifest["status"] in TERMINAL_RUN_STATUSES:
                 return
-            self._store.transition_status(run_id, "failed", error=message)
+            # 终态必须「先落事件, 再落状态」: 读者(前端 SSE / 测试)以 manifest 状态为准判断
+            # 任务已结束, 反序时会出现「status=failed 但事件里没有 error」的窗口, 实测偶发
+            # (tests/test_mining_manager.py::test_runner_exception_marks_failed_and_appends_error_event)。
             self._store.append_event(
                 run_id,
                 "error",
                 {"status": "failed", "message": message},
             )
+            self._store.transition_status(run_id, "failed", error=message)
