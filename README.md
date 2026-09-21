@@ -545,7 +545,7 @@ PORT=3018                      # 服务端口
 
 内置数据源插件 [fuyao](https://fuyao.aicubes.cn/docs/api-reference/) 提供同花顺 REST 数据接口(行情 / 财务 / 龙虎榜 / 盘前风向标 / 交易日历等),需自备 API Key,使用前请遵守其服务条款
 
-数据源示例 [Tushare Pro](https://tushare.pro) 以纯 YAML 自定义源接入(A 股日K / 除权因子 / 分钟K / 全量分钟 / 财务四表,见 [docs/examples/tushare.yaml](./docs/examples/tushare.yaml),接口按积分等级限频),需自备 API Key,使用前请遵守其服务条款
+数据源示例 [Tushare Pro](https://tushare.pro) 以纯 YAML 自定义源接入(A 股日K / 除权因子 / 分钟K / 财务四表,见 [docs/examples/tushare.yaml](./docs/examples/tushare.yaml),接口按积分等级限频),需自备 API Key,使用前请遵守其服务条款。注意 Tushare **没有全市场分钟端点**(`stk_mins` 按标的、`rt_min` 必填 `ts_code` 且无 `trade_time`、`rt_min_daily` 无权限),故示例中的 `full_minute` 段默认注释掉;要持续跑全量分钟请用 TickFlow Expert 档或自写插件
 
 数据源插件 [stock-sdk](https://stock-sdk.linkdiary.cn) 遵循其各自的 ISC 协议。
 

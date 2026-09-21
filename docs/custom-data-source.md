@@ -12,13 +12,20 @@
 | 除权因子 | `adj_factor` | 批量返回一组股票的复权因子 |
 | 实时行情 | `realtime` | 返回全市场快照,用于盘中 enriched 增量计算 |
 | 分钟K | `minute` | 返回 1m 分钟K(需映射出 symbol / datetime / OHLC / 量额) |
-| 全量分钟 | `full_minute` | 与 `minute` 同形;声明后可被路由为「全量分钟」生效源,内置服务盘中按当日窗口全市场批量落盘(仅修复轮语义,节奏下限 60s) || 财务数据 | `financial` | 一个配置覆盖内部 5 张财务表(`metrics`/`income`/`balance_sheet`/`cash_flow`/`shares`),用 `table_map` 把内部表名映射到上游接口名 |
+| 全量分钟 | `full_minute` | 与 `minute` 同形;声明后可被路由为「全量分钟」生效源,内置服务盘中按当日窗口全市场批量落盘(仅修复轮语义,节奏下限 60s)。**要求上游能低成本提供全市场数据**: 每轮会把全市场标的都拉一遍, 纯按标的的源(如 Tushare)代价较高, 见下 |
+| 财务数据 | `financial` | 一个配置覆盖内部 5 张财务表(`metrics`/`income`/`balance_sheet`/`cash_flow`/`shares`),用 `table_map` 把内部表名映射到上游接口名 |
 
 深度盘口(depth5)暂无数据集契约,仍由 TickFlow 提供。
 
 `full_minute` 声明式源只提供修复轮(当日窗口批量);廉价增量端点
 (`get_intraday_latest`)是 Python 插件契约,见
 [plugin-development.md](./plugin-development.md)。
+
+> **上游需要真·全市场数据**: `full_minute` 每轮都把全市场标的拉一遍(用 `batch` 分块)。
+> 上游若有「一次回全市场」的端点(如 TickFlow `intraday.universe`、插件实现
+> `get_intraday_latest`)则代价低;纯按标的的源只能靠批量循环**模拟**, 一轮请求数 =
+> 标的数 / `batch`(实测 Tushare 全市场 ≈ 5568 标的 / 20 ≈ 279 请求/轮), 且每轮重拉当日全量。
+> 选源时先确认这个代价可以接受。
 
 > **声明 ≠ 生效**: 声明 datasets 只是让该源进入对应能力的**候选列表**, 真正生效还需在
 > 设置 → 数据源 的对应能力卡片里点选它(每个能力独立路由)。侧栏徽标/能力卡里的「未接入」
@@ -323,8 +330,8 @@ datasets:
 
 ### 完整示例: Tushare(纯 YAML 接入)
 
-仓内 `docs/examples/tushare.yaml` 是可直接复用的完整配置(日K / 除权因子 / 分钟K / 全量分钟 / 财务四表),
-拷到 `data/data_sources/` 并在 `.env` 配 `TUSHARE_API_KEY` 即可:
+仓内 `docs/examples/tushare.yaml` 是可直接复用的完整配置(日K / 除权因子 / 分钟K / 财务四表;
+全量分钟段**默认注释掉**, 原因见下), 拷到 `data/data_sources/` 并在 `.env` 配 `TUSHARE_API_KEY` 即可:
 
 ```yaml
 auth:
@@ -365,10 +372,15 @@ datasets:
     # ...同构: body.api_name=stk_mins, params.freq=1min,
     # 时间参数用 ${start:%Y-%m-%d %H:%M:%S}, transforms 里 volume: "value / 100"(股→手)
   full_minute:
-    # ...同构 minute(doc_id=370 股票历史分钟行情 = stk_mins), 但拉的是当日窗口
-    # (修复轮自动传 "${start:%Y-%m-%d %H:%M:%S}" = 00:00 → 现在, 北京墙钟);
-    # 声明后即可在 设置 → 数据源 → 全量分钟 选中该源。实测该 key 连续 300 次调用无限频
-    # 报错(36s), batch=20/rpm=240 下全市场(≈5400 只)一轮 ≈ 270 请求 ≈ 70s, 与仅修复轮节奏下限 60s 匹配。
+    # ...同构 minute, 但拉的是当日窗口(00:00 → 现在, 北京墙钟)。⚠ Tushare **没有全市场
+    # 分钟端点**, 实测: stk_mins 按标的拉(多标的逗号串有效, 单请求 8000 行上限);
+    # rt_min 必填 ts_code(否则 50101)且返回里没有 trade_time(只有最新一根);
+    # rt_min_daily 本 key 无权限(40203)。所以这里是「按标的批量模拟当日全市场」:
+    # 全市场 ≈ 5568 标的 / batch 20 ≈ 279 请求/轮(≈70s @rpm 240), 且 YAML 源无
+    # get_intraday_latest 增量端点 → 只能走仅修复轮(节奏下限 60s, 每轮重拉当日全量)。
+    # 因此随仓示例默认不声明该段(需手动取消注释 + 在「数据源 → 全量分钟」选源);
+    # 想要低成本持续全量分钟请用 TickFlow Expert 的 intraday.universe, 或写插件实现
+    # get_intraday_latest。详见仓内 docs/examples/tushare.yaml 该段注释。
   financial:
     # ...同构: table_map 把 4 张内部表映射到 fina_indicator/income/balancesheet/cashflow,
     # body.api_name="${table}", 比率保持百分数、金额保持元、股本万股→股
@@ -376,7 +388,9 @@ datasets:
 
 覆盖范围与注意: 日K仅 A 股(`daily`)——ETF/指数日K需换 `fund_daily`/`index_daily` 接口, 而一个数据集
 只能有一个 url/body 模板, 故这两个数据集的日K请路由到 TickFlow(或另写一个插件);
-分钟K(`stk_mins`)对股票/ETF/指数通用。
+分钟K(`stk_mins`)对股票/ETF/指数通用, 但**只能按标的拉**, Tushare 没有全市场分钟端点
+(`rt_min` 必填 `ts_code` 且返回无 `trade_time`, `rt_min_daily` 无权限), 所以「全量分钟」在 Tushare 上
+只是按标的批量模拟(≈279 请求/轮), 示例里默认注释掉。
 财务只覆盖**内部真实消费**的 4 张表(`metrics`/`income`/`balance_sheet`/`cash_flow`);
 上游另外那些接口(业绩预告/快报、分红送股、审计意见、主营构成、披露计划等)与本项目数据模型
 **没有下游消费方**: 没有对应数据集、服务、因子或页面, 接进来也只会落一堆无人读的 parquet。

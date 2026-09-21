@@ -1,8 +1,10 @@
 # Tushare Pro —— 纯 YAML 自定义数据源(docs/custom-data-source.md 路线)
 #
 # 覆盖数据集: daily(A股日K) / adj_factor(A股除权因子) / minute(A股/ETF/指数分钟K)
-#            / full_minute(全量分钟: 盘中全市场当日 1 分钟K 落盘)
 #            / financial(财务: 利润表/资产负债表/现金流量表/财务指标, 可选历史股本)
+#   可选(默认注释掉): full_minute(全量分钟)。⚠ Tushare **没有全市场分钟端点** ——
+#   stk_mins 按标的拉、rt_min 必填 ts_code 且无 trade_time、rt_min_daily 本 key 无权限;
+#   该段是「按标的批量模拟当日全市场」(≈279 请求/轮、仅修复轮), 详见段内注释。
 #   未声明的数据集(实时行情/五档)自动回退 TickFlow。
 #   ETF/指数**日K**未覆盖(Tushare 需换 fund_daily/index_daily 接口, 一个数据集只有
 #   一个 url/body 模板); 需要时请把这两个数据集的日K路由到 TickFlow。
@@ -18,9 +20,10 @@
 #   - 日K amount 单位为千元(需 *1000), 分钟 vol 单位为股(需 /100);
 #   - 分钟接口 `stk_mins` 单请求 **8000 行硬上限**: 超出是静默截断且丢最旧(实测 20 标的
 #     跨 2 日应回 9640 行, 实得恰好 8000 行) —— 所以 batch 要按「交易日数 × 241 根/股」折算,
-#     多日窗口请调小 batch 或改成两段拉取; full_minute 只拉当日窗口, batch=20 天然安全;
-#   - 全量分钟一轮 = 全市场(≈5400) / batch 20 ≈ 270 个请求; 实测该 key 连续 300 次调用
-#     无配额报错(36s), rpm=240 下一轮 ≈ 70s, 与服务的仅修复轮节奏下限(60s)匹配;
+#     多日窗口请调小 batch 或改成两段拉取。
+#   - 分钟数据的接口选择(实测): `stk_mins` 历史分钟(按标的, 多标的逗号串有效); `rt_min`
+#     实时最新一根(必填 ts_code, 返回无 trade_time); `rt_min_daily` 本 key 无权限(40203)。
+#     因此「全量分钟」在 Tushare 上只能按标的批量拼, 详见 full_minute 段注释。
 #   - 财务接口: income/balancesheet/cashflow/daily_basic **不支持多标的**(逗号串静默 0 行),
 #     fina_indicator 可以; 且部分接口单次约 100 期上限(≈25 年季报, 足够回测用)。
 #   - ts_code 只认「6 位代码.交易所大写后缀」(600000.SH / 000001.SZ / 920002.BJ):
@@ -113,38 +116,46 @@ datasets:
       datetime: "parse_datetime(value, '%Y-%m-%d %H:%M:%S')"
       volume: "value / 100"     # 股 → 手
 
-  # 全量分钟(doc_id=370 股票历史分钟行情 = stk_mins, 与 minute 同源接口)。
-  # 声明后即可在「设置 → 数据源 → 全量分钟」把它选为生效源: 盘中服务按当日窗口
-  # (00:00 → 现在, 北京墙钟)分批拉全市场分钟K 并幂等写入 data/kline_minute/。
-  # YAML 声明式源不提供 get_intraday_latest 廉价增量端点 → 服务自动降级为「仅修复轮」
-  # (节奏下限 60s), 数据不丢(每次都是当日全量幂等覆盖)。
-  full_minute:
-    url: http://api.tushare.pro
-    method: POST
-    batch: 20            # 20 × 241 根 ≈ 4820 行, 留足 8000 行上限余量(超限静默丢最旧)
-    rpm: 240             # 全市场一轮 ≈ 270 请求 ≈ 70s; 实测配额允许更高, 这里与服务节奏对齐
-    timeout: 30
-    response_path: data
-    body:
-      api_name: stk_mins
-      fields: "ts_code,trade_time,open,high,low,close,vol,amount"
-      params:
-        ts_code: "${symbols}"
-        freq: 1min
-        start_date: "${start:%Y-%m-%d %H:%M:%S}"   # 修复轮窗口: 当日 00:00
-        end_date: "${end:%Y-%m-%d %H:%M:%S}"       # → 现在
-    field_map:
-      ts_code: symbol
-      trade_time: datetime
-      open: open
-      high: high
-      low: low
-      close: close
-      vol: volume
-      amount: amount
-    transforms:
-      datetime: "parse_datetime(value, '%Y-%m-%d %H:%M:%S')"
-      volume: "value / 100"     # 股 → 手
+  # ---- 全量分钟(默认不声明; 需要时取消下面整段的注释) ----
+  # Tushare **没有**全市场分钟端点, 实测:
+  #   - `stk_mins`(doc_id=370 股票历史分钟行情): 按标的拉(多标的逗号串有效), 单请求 8000 行硬上限;
+  #   - `rt_min`(实时分钟): 必填 ts_code(不带 → code=50101), 且**返回里没有 trade_time**(只有最新一根),
+  #     拿不到可落盘的时间序列;
+  #   - `rt_min_daily`(看起来是全市场按日): 本 key 无权限(code=40203)。
+  # 所以下面这段是「按标的批量**模拟**当日全市场」, 不是原生全量能力, 代价明确:
+  #   - 一轮 = 全市场标的 / batch 20 ≈ 279 请求(≈70s @rpm 240), 服务节奏下限 60s → 基本连轴转;
+  #   - YAML 声明式源没有 `get_intraday_latest` 增量端点 → 只能「仅修复轮」, 每轮都把当日全量重拉一遍
+  #     (幂等覆盖, 数据不丢, 但请求量大; 连续跑一天的请求量是否触碰上游日配额未实测)。
+  # 想要低成本持续全量分钟, 请用 TickFlow Expert 的 intraday.universe(单请求回全市场), 或写插件实现
+  # get_intraday_latest。确认接受上述代价后, 取消注释并在「设置 → 数据源 → 全量分钟」选中本源。
+  #
+  # full_minute:
+  #   url: http://api.tushare.pro
+  #   method: POST
+  #   batch: 20            # 20 × 241 根 ≈ 4820 行, 留足 8000 行上限余量(超限静默丢最旧)
+  #   rpm: 240             # 全市场一轮 ≈ 279 请求 ≈ 70s; 实测该 key 分钟配额更高, 这里与服务节奏对齐
+  #   timeout: 30
+  #   response_path: data
+  #   body:
+  #     api_name: stk_mins
+  #     fields: "ts_code,trade_time,open,high,low,close,vol,amount"
+  #     params:
+  #       ts_code: "${symbols}"
+  #       freq: 1min
+  #       start_date: "${start:%Y-%m-%d %H:%M:%S}"   # 修复轮窗口: 当日 00:00
+  #       end_date: "${end:%Y-%m-%d %H:%M:%S}"       # → 现在
+  #   field_map:
+  #     ts_code: symbol
+  #     trade_time: datetime
+  #     open: open
+  #     high: high
+  #     low: low
+  #     close: close
+  #     vol: volume
+  #     amount: amount
+  #   transforms:
+  #     datetime: "parse_datetime(value, '%Y-%m-%d %H:%M:%S')"
+  #     volume: "value / 100"     # 股 → 手
 
   financial:
     url: http://api.tushare.pro

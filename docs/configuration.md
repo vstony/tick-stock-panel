@@ -36,7 +36,9 @@ TickFlow 是内置默认数据源;同时支持插件化接入第三方数据源(
 「全量分钟」是一项**独立能力**(能力键 `full_minute`,探测名 `intraday.universe`),与其他能力同样**可路由**:盘中把全市场当日 1 分钟 K 持续增量落盘到本地 `data/kline_minute/` 当日分区,分钟策略(`minute_filter`)与分时视图即可读到新鲜数据。接入方式二选一:
 
 - **TickFlow Expert**:配置 Expert 档 Key,零配置即用(修复轮 `intraday.batch` + 稳态 `intraday.universe` 单请求增量)
-- **插件/自定义源**:声明 `full_minute` 数据集并在 **设置 → 数据源 → 全量分钟** 路由到该源 — Python 插件实现 `get_intraday_batch`(必需)/`get_intraday_latest`(可选,未实现自动降级仅修复轮、节奏下限 60s);YAML 声明式源数据集配置与 `minute` 同形(仅修复轮语义)。契约细节见 [plugin-development.md](./plugin-development.md) 与 [custom-data-source.md](./custom-data-source.md);可直接复用的 YAML 示例见 [docs/examples/tushare.yaml](./examples/tushare.yaml)(`full_minute` 段用 `stk_mins` 拉当日窗口)
+- **插件/自定义源**:声明 `full_minute` 数据集并在 **设置 → 数据源 → 全量分钟** 路由到该源 — Python 插件实现 `get_intraday_batch`(必需)/`get_intraday_latest`(可选,未实现自动降级仅修复轮、节奏下限 60s);YAML 声明式源数据集配置与 `minute` 同形(仅修复轮语义)。契约细节见 [plugin-development.md](./plugin-development.md) 与 [custom-data-source.md](./custom-data-source.md)。
+
+> **前提:上游得有真·全市场数据能力**。「全量分钟」每轮把全市场标的都拉一遍(按 `batch` 分块),所以对纯按标的的 HTTP 上游只是个**批量模拟**:全市场 ≈ 5568 标的 / `batch` 20 ≈ **279 请求/轮**、每轮重拉当日全量(仅修复轮、不丢数据但请求量大)。实测 **Tushare 没有全市场分钟端点** —— `stk_mins` 按标的拉(单请求 8000 行静默截断)、`rt_min` 必填 `ts_code` 且返回无 `trade_time`、`rt_min_daily` 无权限(`40203`) —— 因此 [docs/examples/tushare.yaml](./examples/tushare.yaml) 里 `full_minute` 段**默认注释掉**, 仅作为「按标的批量」的现成 recipe;要持续低成本跑全量分钟, 用 TickFlow Expert 的 `intraday.universe` 或写插件实现 `get_intraday_latest`。
 
 接入步骤:
 
