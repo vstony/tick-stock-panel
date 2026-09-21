@@ -14,10 +14,12 @@
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -101,6 +103,12 @@ def _default_store_dir() -> Path:
 
 _STORE_DIR = _default_store_dir()
 
+# 读 job 文件的重试预算: 写盘已是原子替换, 仍留几次机会给 Windows 上的瞬时共享冲突。
+_READ_ATTEMPTS = 4
+_READ_RETRY_SLEEP_S = 0.02
+# 原子替换撞共享冲突时的重试间隔(递增): 读者持句柄窗口是微秒级, 首次重试一般即成功。
+_WRITE_RETRY_DELAYS_S = (0.01, 0.03, 0.1, 0.3)
+
 
 class JobStore:
     def __init__(self, max_jobs: int = 50, store_dir: Path = _STORE_DIR) -> None:
@@ -115,26 +123,58 @@ class JobStore:
     # ===== persistence =====
 
     def _write_file(self, job: dict[str, Any]) -> None:
-        """将 job 快照写入独立 JSON 文件(create/start/终态均落盘)。"""
+        """将 job 快照写入独立 JSON 文件(create/start/终态均落盘)。
+
+        **原子写**: 先写同目录临时文件再 ``os.replace``。原来的 ``path.write_text``
+        是「截断 + 写入」, 与同一时刻的读者(api 查询线程 / 前端轮询 / 另一个
+        job 线程)竞态时, 读者会读到**半截 JSON** → ``json.loads`` 抛错 →
+        ``get()`` 返回 None, 表现为「任务记录凭空消失」(实测:
+        tests/test_pipeline_capacity.py 偶发 ``store.get(jid)`` → None → TypeError)。
+
+        替换**失败要重试**: Windows 上 ``MoveFileEx(replace)`` 在目标文件正被读者打开时
+        会抛共享冲突(PermissionError) —— 而这恰恰是最常见的并发形态(前端 5ms 轮询),
+        实测一次不重试就会丢掉终态快照, 任务永远停在 running。重试间隔递增,
+        读者持句柄的窗口是微秒级。
+        """
         path = self._store_dir / f"{job['id']}.json"
-        try:
-            path.write_text(
-                json.dumps(job, ensure_ascii=False, indent=None),
-                encoding="utf-8",
-            )
-        except Exception:
-            logger.warning("failed to write job file %s", path)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        payload = json.dumps(job, ensure_ascii=False, indent=None)
+        last_error: Exception | None = None
+        for delay in _WRITE_RETRY_DELAYS_S:
+            try:
+                tmp.write_text(payload, encoding="utf-8")
+                os.replace(tmp, path)
+                return
+            except PermissionError as e:  # 目标被读者占用: 稍后重试
+                last_error = e
+                time.sleep(delay)
+            except Exception:
+                logger.warning("failed to write job file %s", path)
+                with contextlib.suppress(Exception):
+                    tmp.unlink()
+                return
+        logger.warning("failed to write job file %s: %s", path, last_error)
+        with contextlib.suppress(Exception):
+            tmp.unlink()
 
     def _read_file(self, job_id: str) -> dict[str, Any] | None:
-        """从磁盘读取单个 job 文件。"""
+        """从磁盘读取单个 job 文件; 文件不存在返回 None。
+
+        读到半截内容/瞬时共享冲突时**重试**若干次再放弃: 单次失败就把正在运行的
+        任务报成「不存在」会让 API 与前端出现假的 404。
+        """
         path = self._store_dir / f"{job_id}.json"
-        if not path.exists():
-            return None
-        try:
-            return json.loads(path.read_text("utf-8"))
-        except Exception:
-            logger.warning("failed to read job file %s", path)
-            return None
+        last_error: Exception | None = None
+        for _ in range(_READ_ATTEMPTS):
+            if not path.exists():
+                return None
+            try:
+                return json.loads(path.read_text("utf-8"))
+            except Exception as e:  # 任何读失败都值得重试
+                last_error = e
+                time.sleep(_READ_RETRY_SLEEP_S)
+        logger.warning("failed to read job file %s: %s", path, last_error)
+        return None
 
     def _delete_oldest(self) -> None:
         """删除最老的 job 文件,保持文件数量 < max_jobs。"""
@@ -153,10 +193,10 @@ class JobStore:
         """扫描磁盘上所有 job 文件,按 started_at 从新到旧排序。"""
         jobs: list[dict[str, Any]] = []
         for f in self._store_dir.glob("*.json"):
-            try:
-                jobs.append(json.loads(f.read_text("utf-8")))
-            except Exception:
-                continue
+            # 复用带重试的读盘: 瞬时半截文件不该让某个任务从列表里消失一轮
+            job = self._read_file(f.stem)
+            if job is not None:
+                jobs.append(job)
         jobs.sort(key=lambda j: j.get("started_at") or "", reverse=True)
         return jobs
 
@@ -410,7 +450,7 @@ class JobStore:
             now = datetime.now(start_dt.tzinfo)
             stalled_s = (now - alive_dt).total_seconds()
             total_s = (now - start_dt).total_seconds()
-        except Exception:  # noqa: BLE001
+        except Exception:
             return
         if stalled_s > timeout_s:
             logger.warning(
@@ -443,10 +483,8 @@ class JobStore:
             self._active_jobs.clear()
             self._active_id = None
             for f in self._store_dir.glob("*.json"):
-                try:
+                with contextlib.suppress(Exception):
                     f.unlink()
-                except Exception:
-                    pass
         with _CANCEL_FLAGS_LOCK:
             _CANCEL_FLAGS.clear()
 
@@ -473,7 +511,7 @@ def _duration_s(j: dict[str, Any]) -> float | None:
         s = datetime.fromisoformat(j["started_at"])
         e = datetime.fromisoformat(j["finished_at"])
         return round((e - s).total_seconds(), 2)
-    except Exception:  # noqa: BLE001
+    except Exception:
         return None
 
 
