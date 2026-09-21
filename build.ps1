@@ -14,11 +14,15 @@
     - 本地运行: 开发模式(前后端热更新, 复用 dev.ps1)或生产模式(单端口, 后端托管
       frontend/dist)。
 
+    远端分工(固定, 每次启动自动校对): origin = 上游仓库 shy3130(只用于 fetch/pull),
+    vstony = 自己的 fork(只用于 push)。在线更新永远从上游拉, 推送变更永远推到 fork,
+    并把 remote.pushDefault 设为 vstony —— 裸 `git push` 也不会误推到上游。
+
 .PARAMETER Task
     菜单编号(位置参数, 推荐):
         0=一键全流程  1=在线更新  2=条件编译  3=本地运行  4=同步依赖
-        5=运行测试    6=清理产物  7=状态检查  q=退出(不执行)
-    也可写任务名: menu(默认, 交互菜单) | all | update | build | run | deps | test | status | clean。
+        5=运行测试    6=清理产物  7=状态检查  8=推送变更到 fork  q=退出(不执行)
+    也可写任务名: menu(默认, 交互菜单) | all | update | push | build | run | deps | test | status | clean。
     编号 2/3 会直接执行该步动作(条件编译 / 本地运行, 用 -BackendExtras / -RunMode 控制),
     不会像菜单那样再弹子菜单; 需要交互改配置时直接运行 `\build.ps1`(无参数)
 
@@ -82,6 +86,10 @@
     .\build.ps1 -Task run -RunMode prod
     生产模式: 单端口启动, 前端由后端托管(frontend/dist)。
 
+.EXAMPLE
+    .\build.ps1 8
+    把本地已提交的变更推送到自己的 fork (vstony); 上游 shy3130 不受影响。
+
 .NOTES
     执行策略受限时先运行:
         Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
@@ -92,8 +100,8 @@
 [CmdletBinding()]
 param(
     # 位置参数: 菜单编号(0-7/q) 或 任务名(menu/all/update/build/run/deps/test/status/clean)
-    [ValidateSet('menu', 'all', 'update', 'build', 'run', 'deps', 'test', 'status', 'clean',
-        '0', '1', '2', '3', '4', '5', '6', '7', 'q')]
+    [ValidateSet('menu', 'all', 'update', 'push', 'build', 'run', 'deps', 'test', 'status', 'clean',
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', 'q')]
     [Parameter(Position = 0)]
     [string]$Task = 'menu',
 
@@ -131,6 +139,16 @@ $VersionFile  = Join-Path $Root 'VERSION'
 $DevScript    = Join-Path $Root 'dev.ps1'
 $FrontendDist = Join-Path $FrontendDir 'dist'
 $DesktopDist  = Join-Path $BackendDir 'dist'
+
+# ============================== 远端仓库分工 ==============================
+# 固定「从上游拉、往自己的 fork 推」, 不依赖每个人本地的 remote 配置:
+#   origin → 上游仓库(只 fetch/pull)    vstony → 自己的 fork(只 push)
+# 启动时校对这两个 remote 的 URL 与 remote.pushDefault(见 Ensure-Remotes),
+# 避免手滑把本地改动推到上游仓库。
+$UpstreamRemote = 'origin'
+$UpstreamUrl    = 'https://github.com/shy3130/tick-stock-panel.git'
+$ForkRemote     = 'vstony'
+$ForkUrl        = 'https://github.com/vstony/tick-stock-panel.git'
 
 # 编译配置(菜单 2 可改)
 $script:Cfg = [ordered]@{
@@ -174,6 +192,14 @@ function Invoke-Guarded {
 
 function Confirm-Action([string]$Message) {
     if ($Yes) { Write-Info "已自动确认: $Message (-Yes)"; return $true }
+    # 输入被重定向(管道 / CI / 非交互宿主)时 Read-Host 会直接返回空串, 而空串在本函数里
+    # 等价于「回车 = 同意」—— 于是一句 `echo n | .\build.ps1 8` 会静默把提交推到远端。
+    # 这种环境下一律按「否」处理(宁可什么都不做), 确实要在自动化里执行请显式加 -Yes。
+    if ([Console]::IsInputRedirected) {
+        Write-Warn "当前输入不是交互式终端, 已按「否」处理: $Message"
+        Write-Info '如需在自动化中执行, 请显式加 -Yes'
+        return $false
+    }
     $answer = Read-Host "$Message [Y/n]"
     if ([string]::IsNullOrWhiteSpace($answer)) { return $true }
     return (@('y', 'yes', '是') -contains $answer.Trim().ToLower())
@@ -260,13 +286,25 @@ function Ensure-EnvFile {
 }
 
 # ============================== 状态采集 ==============================
+# 相对某个 ref 的「领先 / 落后」提交数, 返回 @(领先, 落后); 取不到时返回 @(0, 0)
+function Get-AheadBehind([string]$Ref) {
+    $counts = & git -C $Root rev-list --left-right --count "HEAD...$Ref" 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $counts) { return @(0, 0) }
+    $parts = @($counts -split '\s+' | Where-Object { $_ })
+    if ($parts.Count -lt 2) { return @(0, 0) }
+    return @([int]$parts[0], [int]$parts[1])
+}
+
 function Get-GitState {
     $state = [ordered]@{
         IsRepo = (Test-Path (Join-Path $Root '.git'))
         Branch = '-'
-        Upstream = ''
+        Upstream = ''      # 上游引用(origin/<分支>): 落后多少 = 有多少更新可拉
         Ahead = 0
         Behind = 0
+        Fork = ''          # fork 引用(vstony/<分支>): 领先多少 = 有多少提交待推送
+        ForkAhead = 0
+        ForkBehind = 0
         Tracked = 0
         Untracked = 0
     }
@@ -275,16 +313,22 @@ function Get-GitState {
     $branch = & git -C $Root rev-parse --abbrev-ref HEAD 2>$null
     if ($LASTEXITCODE -eq 0 -and $branch) { $state.Branch = $branch.Trim() }
 
-    $up = & git -C $Root rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>$null
-    if ($LASTEXITCODE -eq 0 -and $up) {
-        $state.Upstream = $up.Trim()
-        $counts = (& git -C $Root rev-list --left-right --count "HEAD...$($state.Upstream)" 2>$null)
-        if ($LASTEXITCODE -eq 0 -and $counts) {
-            $parts = ($counts -split '\s+') | Where-Object { $_ }
-            if ($parts.Count -ge 2) {
-                $state.Ahead = [int]$parts[0]
-                $state.Behind = [int]$parts[1]
-            }
+    # 按「远端名/同名分支」直接比对, 不依赖分支的 upstream 跟踪配置:
+    # fork 工作流里跟踪常被改成自己的 fork, 那样就看不出离上游还差多少。
+    if ($state.Branch -ne '-') {
+        $up = "$UpstreamRemote/$($state.Branch)"
+        if (& git -C $Root rev-parse --verify --quiet "refs/remotes/$up" 2>$null) {
+            $state.Upstream = $up
+            $pair = Get-AheadBehind $up
+            $state.Ahead = $pair[0]
+            $state.Behind = $pair[1]
+        }
+        $fork = "$ForkRemote/$($state.Branch)"
+        if (& git -C $Root rev-parse --verify --quiet "refs/remotes/$fork" 2>$null) {
+            $state.Fork = $fork
+            $pair = Get-AheadBehind $fork
+            $state.ForkAhead = $pair[0]
+            $state.ForkBehind = $pair[1]
         }
     }
 
@@ -338,8 +382,14 @@ function Show-Status {
     Write-Host ("  仓库目录   : {0}" -f $Root)
     if ($s.IsRepo) {
         $track = "领先 {0} / 落后 {1}" -f $s.Ahead, $s.Behind
-        if (-not $s.Upstream) { $track = '未设置上游分支' }
+        if (-not $s.Upstream) { $track = '无本地记录(先执行在线更新)' }
         Write-Host ("  分支       : {0}{1} ({2})" -f $s.Branch, $(if ($s.Upstream) { " → $($s.Upstream)" } else { '' }), $track)
+        $pushTrack = if (-not $s.Fork) { '无本地记录(下次拉取后可见)' }
+        elseif ($s.ForkBehind -gt 0) { "远端领先 $($s.ForkBehind) 个提交(需先同步)" }
+        elseif ($s.ForkAhead -gt 0) { "待推送 $($s.ForkAhead) 个提交" }
+        else { '已同步' }
+        Write-Host ("  拉取来源   : {0} → {1}" -f $UpstreamRemote, $UpstreamUrl)
+        Write-Host ("  推送目标   : {0} → {1} ({2})" -f $ForkRemote, $ForkUrl, $pushTrack)
         Write-Host ("  本地改动   : 已跟踪 {0} 项, 未跟踪 {1} 项" -f $s.Tracked, $s.Untracked)
     } else {
         Write-Host '  分支       : 非 Git 仓库(在线更新不可用)'
@@ -395,6 +445,42 @@ function Show-Status {
     Write-Host '  数据       : data/ 已在 .gitignore 中, 更新与清理都不会触碰'
 }
 
+# ============================== 远端分工 ==============================
+# 幂等校对远端: origin 必须指向上游(shy3130), vstony 必须指向自己的 fork,
+# 且裸 `git push` 默认推 fork。各人本地 clone 的 remote 名/URL/推送方式各不相同,
+# 与其依赖口头约定, 不如每次启动都纠正一遍(非本仓库或无 git 时静默跳过)。
+function Ensure-Remotes {
+    if (-not (Test-Path (Join-Path $Root '.git'))) { return }
+    if (-not (Get-Command git -ErrorAction SilentlyContinue)) { return }
+
+    $targets = @(
+        [pscustomobject]@{ Name = $UpstreamRemote; Url = $UpstreamUrl; Role = '上游(只拉取)' },
+        [pscustomobject]@{ Name = $ForkRemote; Url = $ForkUrl; Role = 'fork(只推送)' }
+    )
+    foreach ($t in $targets) {
+        $current = (& git -C $Root remote get-url $t.Name 2>$null)
+        if (-not $current) {
+            & git -C $Root remote add $t.Name $t.Url 2>&1 | ForEach-Object { Write-Host "    $_" }
+            if ($LASTEXITCODE -eq 0) { Write-Ok "已添加远端 $($t.Name) [$($t.Role)] → $($t.Url)" }
+            continue
+        }
+        if ($current.Trim() -ne $t.Url) {
+            Write-Warn "远端 $($t.Name) 原指向 $($current.Trim()), 已纠正为 $($t.Url)"
+            & git -C $Root remote set-url $t.Name $t.Url 2>&1 | ForEach-Object { Write-Host "    $_" }
+        }
+        # 独立的 pushurl 会让「拉取来源」与「推送目标」对不上, 统一清掉改用 remote.pushDefault
+        if (& git -C $Root config --get "remote.$($t.Name).pushurl" 2>$null) {
+            & git -C $Root config --unset "remote.$($t.Name).pushurl" 2>&1 | Out-Null
+            Write-Info "已移除 $($t.Name) 的独立 pushurl(推送目标统一由 remote.pushDefault 决定)"
+        }
+    }
+
+    if ((& git -C $Root config --get remote.pushDefault 2>$null) -ne $ForkRemote) {
+        & git -C $Root config remote.pushDefault $ForkRemote 2>&1 | Out-Null
+        Write-Info "git push 默认目标已设为 $ForkRemote"
+    }
+}
+
 # ============================== 任务: 在线更新 ==============================
 function Get-ShortSha {
     $sha = & git -C $Root rev-parse --short HEAD 2>$null
@@ -420,28 +506,37 @@ function Restore-Stash([string]$StashSha, [string]$StashMessage) {
 }
 
 function Update-Repo {
-    Write-Step '在线更新: 拉取上游代码'
+    Write-Step "在线更新: 从上游 $UpstreamRemote 拉取($UpstreamUrl)"
     if (-not (Test-Path (Join-Path $Root '.git'))) {
         Write-Warn '当前目录不是 Git 仓库, 跳过在线更新'
         return
     }
     Require-Command 'git'
+    Ensure-Remotes
 
     $s = Get-GitState
-    if (-not $s.Upstream) {
-        Write-Warn "分支 $($s.Branch) 未设置上游分支, 跳过 pull"
-        Write-Info "如需启用: git branch --set-upstream-to=origin/$($s.Branch) $($s.Branch)"
+    if ($s.Branch -eq '-') {
+        Write-Warn '当前处于游离 HEAD 状态, 跳过 pull'
         return
     }
+    $upstreamRef = "$UpstreamRemote/$($s.Branch)"
 
-    Write-Info "拉取远端 (git fetch --prune origin)"
-    & git -C $Root fetch --prune origin 2>&1 | ForEach-Object { Write-Host "    $_" }
-    if ($LASTEXITCODE -ne 0) { Stop-Fatal 'git fetch 失败(检查网络或代理设置)' }
+    Write-Info "拉取远端 (git fetch --prune $UpstreamRemote)"
+    & git -C $Root fetch --prune $UpstreamRemote 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) { Stop-Fatal "git fetch $UpstreamRemote 失败(检查网络或代理设置)" }
+    # fork 状态只用于提示「有多少提交待推送」, 拉取失败不影响本次更新
+    & git -C $Root fetch --prune $ForkRemote 2>&1 | Out-Null
+
+    if (-not (& git -C $Root rev-parse --verify --quiet "refs/remotes/$upstreamRef" 2>$null)) {
+        Write-Warn "上游没有分支 $($s.Branch)($upstreamRef), 跳过 pull"
+        return
+    }
 
     $s = Get-GitState
     if ($s.Behind -eq 0) {
         Write-Ok "已是最新版本 (HEAD $((Get-ShortSha)))"
         if ($s.Ahead -gt 0) { Write-Info "本地领先上游 $($s.Ahead) 个提交" }
+        Show-PushHint $s
         Show-EnvKeyDiff
         return
     }
@@ -478,10 +573,11 @@ function Update-Repo {
         Write-Info '无已跟踪文件改动, 无需暂存'
     }
 
-    # ---- 2. pull: 优先 fast-forward, 失败时按情况处理 ----
-    # 先捕获再逐行输出: 需要根据输出判断是否被未跟踪文件挡住, 且避免重复执行 pull
-    Write-Info '合并上游 (git pull --ff-only)'
-    $pullOut = & git -C $Root pull --ff-only 2>&1
+    # ---- 2. 合并上游: 优先 fast-forward, 失败时按情况处理 ----
+    # 用 `git merge --ff-only <上游引用>` 而非 `git pull`: pull 依赖分支的 upstream 跟踪,
+    # 而 fork 工作流里这条跟踪常被改成自己的 fork。先捕获再逐行输出, 便于判断失败原因。
+    Write-Info "合并上游 (git merge --ff-only $upstreamRef)"
+    $pullOut = & git -C $Root merge --ff-only $upstreamRef 2>&1
     $pullCode = $LASTEXITCODE
     $pullText = ($pullOut | Out-String)
     $pullOut | ForEach-Object { Write-Host "    $_" }
@@ -497,15 +593,15 @@ function Update-Repo {
                 if ($LASTEXITCODE -ne 0) { Stop-Fatal 'git stash -u 失败' }
                 $stashed = $true
                 if (-not $stashMessage) { $stashMessage = $msg2 }
-                Write-Info '重试合并 (git pull --ff-only)'
-                $pullOut = & git -C $Root pull --ff-only 2>&1
+                Write-Info "重试合并 (git merge --ff-only $upstreamRef)"
+                $pullOut = & git -C $Root merge --ff-only $upstreamRef 2>&1
                 $pullCode = $LASTEXITCODE
                 $pullOut | ForEach-Object { Write-Host "    $_" }
             }
         } elseif ($s.Ahead -gt 0) {
-            Write-Warn "本地有 $($s.Ahead) 个未推送提交, fast-forward 不可用"
-            if (Confirm-Action "改为 git rebase $($s.Upstream) 变基到上游?(有冲突会中断并保留现场)") {
-                & git -C $Root rebase $s.Upstream 2>&1 | ForEach-Object { Write-Host "    $_" }
+            Write-Warn "本地有 $($s.Ahead) 个本地提交, fast-forward 不可用"
+            if (Confirm-Action "改为 git rebase $upstreamRef 变基到上游?(有冲突会中断并保留现场)") {
+                & git -C $Root rebase $upstreamRef 2>&1 | ForEach-Object { Write-Host "    $_" }
                 $pullCode = $LASTEXITCODE
                 if ($pullCode -ne 0) {
                     Write-Warn 'rebase 中断(可能有冲突)'
@@ -531,7 +627,71 @@ function Update-Repo {
     if ($lockBefore -ne (Get-LockFingerprint)) {
         Write-Warn '依赖锁文件已随上游更新, 编译阶段会重新同步依赖(uv sync / pnpm install)'
     }
+    Show-PushHint (Get-GitState)
     Show-EnvKeyDiff
+}
+
+# 提示「本地比自己的 fork 领先多少」。只提示不自动推送 —— 推送是对外可见的显式动作,
+# 需要时用菜单 8 / .\build.ps1 8 / -Task push。
+function Show-PushHint($State) {
+    if (-not $State.Fork) {
+        Write-Info "推送目标 $ForkRemote($ForkUrl); 需要推送时执行 .\build.ps1 8"
+        return
+    }
+    if ($State.ForkAhead -gt 0) {
+        Write-Info "本地领先 $($State.Fork) $($State.ForkAhead) 个提交, 需要推送时执行 .\build.ps1 8 (-Task push)"
+    } elseif ($State.ForkBehind -gt 0) {
+        Write-Warn "$($State.Fork) 有 $($State.ForkBehind) 个本地没有的提交, 推送前需要先合并"
+    } else {
+        Write-Ok "$($State.Fork) 已同步"
+    }
+}
+
+# ============================== 任务: 推送变更 ==============================
+# 只把已提交的内容推到自己的 fork; 不做强推 —— 远端有本地没有的提交时直接报错，
+# 让用户先在线更新(菜单 1), 避免一不小心覆盖远端。
+function Push-Changes {
+    Write-Step "推送变更: 推送到 $ForkRemote($ForkUrl)"
+    if (-not (Test-Path (Join-Path $Root '.git'))) {
+        Write-Warn '当前目录不是 Git 仓库, 跳过推送'
+        return
+    }
+    Require-Command 'git'
+    Ensure-Remotes
+
+    $s = Get-GitState
+    if ($s.Branch -eq '-') { Write-Warn '当前处于游离 HEAD 状态, 跳过推送'; return }
+    $branch = $s.Branch
+
+    Write-Info "拉取远端 (git fetch --prune $ForkRemote)"
+    & git -C $Root fetch --prune $ForkRemote 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) { Stop-Fatal "git fetch $ForkRemote 失败(检查网络或代理设置)" }
+
+    $s = Get-GitState
+    if ($s.Fork -and $s.ForkBehind -gt 0) {
+        Stop-Fatal "$($s.Fork) 有 $($s.ForkBehind) 个本地没有的提交, 先在线更新(菜单 1)再推送, 否则会被拒绝或覆盖远端"
+    }
+    if ($s.Fork -and $s.ForkAhead -eq 0) {
+        Write-Ok "$($s.Fork) 已是最新 (HEAD $((Get-ShortSha)))"
+        return
+    }
+    if ($s.Tracked -gt 0) {
+        Write-Warn "$($s.Tracked) 个已跟踪文件的未提交改动不会被推送(需要先 git commit)"
+    }
+
+    Write-Info '待推送的提交(最多显示 10 条):'
+    if ($s.Fork) {
+        & git -C $Root log --oneline --no-decorate --max-count=10 "$($s.Fork)..HEAD" 2>$null | ForEach-Object { Write-Host "    $_" }
+    } else {
+        & git -C $Root log --oneline --no-decorate --max-count=10 2>$null | ForEach-Object { Write-Host "    $_" }
+        Write-Info "$ForkRemote 上还没有分支 $branch, 本次推送会新建"
+    }
+
+    if (-not (Confirm-Action "推送到 $ForkRemote/$branch ?")) { Write-Info '已取消推送'; return }
+
+    & git -C $Root push $ForkRemote $branch 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) { Stop-Fatal "git push $ForkRemote 失败(认证失败 / 网络异常 / 远端有本地没有的提交都会导致失败)" }
+    Write-Ok "推送完成: HEAD $((Get-ShortSha)) → $ForkRemote/$branch"
 }
 
 # 上游 .env.example 新增了配置项时给出提示(不自动改用户的 .env)
@@ -928,11 +1088,15 @@ function Show-Banner {
 
     $s = Get-GitState
     if ($s.IsRepo) {
-        $track = "领先 $($s.Ahead) / 落后 $($s.Behind)"
-        if (-not $s.Upstream) { $track = '无上游' }
+        $track = "领先上游 $($s.Ahead) / 落后上游 $($s.Behind)"
+        if (-not $s.Upstream) { $track = '无上游引用' }
         Write-Host ("  分支 {0}  |  VERSION {1}  |  本地改动 {2}  |  {3}" -f `
             $s.Branch, $(if (Test-Path $VersionFile) { (Get-Content $VersionFile -Raw).Trim() } else { '?' }),
             $s.Tracked, $track) -ForegroundColor DarkGray
+        $pushHint = if (-not $s.Fork) { '未拉取 fork 状态' }
+        elseif ($s.ForkAhead -gt 0) { "待推送 $($s.ForkAhead)" }
+        else { 'fork 已同步' }
+        Write-Host ("  远端: {0}=拉取上游 / {1}=推送变更  |  {2}" -f $UpstreamRemote, $ForkRemote, $pushHint) -ForegroundColor DarkGray
     } else {
         Write-Host '  非 Git 仓库模式' -ForegroundColor DarkGray
     }
@@ -953,11 +1117,12 @@ function Show-MenuOnce {
     Write-Host '  5) 运行测试      后端 pytest'
     Write-Host '  6) 清理产物      frontend/dist, backend/dist, __pycache__'
     Write-Host '  7) 状态检查      工具链 / 依赖 / 产物 / 端口'
+    Write-Host '  8) 推送变更      推送本地提交到自己的 fork (vstony)'
     Write-Host '  Q) 退出'
     Write-Host '------------------------------------------------------------'
     Write-Host '  提示: 也可 .\build.ps1 <编号> 直达某一步(例: .\build.ps1 0)' -ForegroundColor DarkGray
 
-    $choice = (Read-Host '请选择 [0-7/Q]').Trim().ToLower()
+    $choice = (Read-Host '请选择 [0-8/Q]').Trim().ToLower()
     switch ($choice) {
         '0' { Invoke-FullFlow }
         '1' { Invoke-Guarded '在线更新' { Update-Repo } }
@@ -967,6 +1132,7 @@ function Show-MenuOnce {
         '5' { Invoke-Guarded '运行测试' { Run-Tests } }
         '6' { Clear-Artifacts }
         '7' { Show-Status }
+        '8' { Invoke-Guarded '推送变更' { Push-Changes } }
         'q' { $script:ExitMenu = $true }
         '' { }
         default { Write-Warn "无效选项: $choice" }
@@ -1029,6 +1195,12 @@ function Select-RunMode {
 }
 
 function Invoke-Menu {
+    # 非交互输入下 Read-Host 恒返回空串, 菜单会变成无限循环刷屏, 直接退出并提示用位置参数
+    if ([Console]::IsInputRedirected) {
+        Write-Warn '当前输入不是交互式终端, 菜单不可用'
+        Write-Info '请用位置参数直达某一步: .\build.ps1 0(一键全流程) / 1(更新) / 7(状态) / 8(推送) 等'
+        return
+    }
     Write-Info '菜单模式: 0 = 一键全流程(更新 → 编译 → 运行); Q = 退出'
     while (-not $script:ExitMenu) { Show-MenuOnce }
 }
@@ -1047,6 +1219,7 @@ function Resolve-TaskAction([string]$Raw) {
         '5'     { return 'test' }
         '6'     { return 'clean' }
         '7'     { return 'status' }
+        '8'     { return 'push' }
         'q'     { return 'quit' }
         ''      { return 'menu' }
         default { return $key }
@@ -1055,6 +1228,7 @@ function Resolve-TaskAction([string]$Raw) {
 
 # ============================== 入口 ==============================
 Ensure-EnvFile
+Ensure-Remotes
 
 $action = Resolve-TaskAction $Task
 
@@ -1075,6 +1249,7 @@ if ($action -eq 'quit') {
     switch ($action) {
         'all'    { Invoke-Guarded '一键全流程' { Invoke-FullFlow } }
         'update' { Invoke-Guarded '在线更新' { Update-Repo } }
+        'push'   { Invoke-Guarded '推送变更' { Push-Changes } }
         'build'  { Invoke-Guarded '条件编译' { Start-Build } }
         'run'    { Invoke-Guarded '本地运行' { Start-Local } }
         'deps'   { Invoke-Guarded '同步依赖' { Sync-Deps } }
@@ -1086,17 +1261,3 @@ if ($action -eq 'quit') {
 }
 
 if ($script:Failed) { exit 1 }
-    # 输入被重定向(管道 / CI / 非交互宿主)时 Read-Host 会直接返回空串, 而空串在本函数里
-    # 等价于「回车 = 同意」—— 于是一句 `echo n | .\build.ps1 8` 会静默把提交推到远端。
-    # 这种环境下一律按「否」处理(宁可什么都不做), 确实要在自动化里执行请显式加 -Yes。
-    if ([Console]::IsInputRedirected) {
-        Write-Warn "当前输入不是交互式终端, 已按「否」处理: $Message"
-        Write-Info '如需在自动化中执行, 请显式加 -Yes'
-        return $false
-    }
-    # 非交互输入下 Read-Host 恒返回空串, 菜单会变成无限循环刷屏, 直接退出并提示用位置参数
-    if ([Console]::IsInputRedirected) {
-        Write-Warn '当前输入不是交互式终端, 菜单不可用'
-        Write-Info '请用位置参数直达某一步: .\build.ps1 0(一键全流程) / 1(更新) / 7(状态) / 8(推送) 等'
-        return
-    }
