@@ -1086,3 +1086,17 @@ if ($action -eq 'quit') {
 }
 
 if ($script:Failed) { exit 1 }
+    # 输入被重定向(管道 / CI / 非交互宿主)时 Read-Host 会直接返回空串, 而空串在本函数里
+    # 等价于「回车 = 同意」—— 于是一句 `echo n | .\build.ps1 8` 会静默把提交推到远端。
+    # 这种环境下一律按「否」处理(宁可什么都不做), 确实要在自动化里执行请显式加 -Yes。
+    if ([Console]::IsInputRedirected) {
+        Write-Warn "当前输入不是交互式终端, 已按「否」处理: $Message"
+        Write-Info '如需在自动化中执行, 请显式加 -Yes'
+        return $false
+    }
+    # 非交互输入下 Read-Host 恒返回空串, 菜单会变成无限循环刷屏, 直接退出并提示用位置参数
+    if ([Console]::IsInputRedirected) {
+        Write-Warn '当前输入不是交互式终端, 菜单不可用'
+        Write-Info '请用位置参数直达某一步: .\build.ps1 0(一键全流程) / 1(更新) / 7(状态) / 8(推送) 等'
+        return
+    }
