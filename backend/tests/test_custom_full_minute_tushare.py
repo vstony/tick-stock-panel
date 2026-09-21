@@ -90,6 +90,40 @@ def _provider(monkeypatch, config: dict, handler) -> tuple[GenericHTTPProvider, 
     return provider, sent
 
 
+def _commented_recipe_lines() -> list[str]:
+    """取出示例里 `# full_minute:` 起的整段注释(datasets 层的两空格缩进保留在 `#` 前)。"""
+    lines = EXAMPLE_YAML.read_text(encoding="utf-8").splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "# full_minute:")
+    except StopIteration:  # pragma: no cover - recipe 被删掉时给出可读失败
+        raise AssertionError("示例里找不到注释掉的 `# full_minute:` recipe 段") from None
+    block: list[str] = []
+    for line in lines[start:]:
+        if not line.strip().startswith("#"):
+            break
+        block.append(line)
+    return block
+
+
+def _example_full_minute_recipe() -> dict:
+    """把注释段的 `# ` 去掉后当 YAML 解析 —— 拿到「取消注释后」的那份配置。"""
+    import yaml
+
+    uncommented = []
+    for line in _commented_recipe_lines():
+        body = line[2:].removeprefix("# ")  # `  # xxx` → 原始行内容(含原缩进)
+        uncommented.append(f"  {body}")
+    return yaml.safe_load("\n".join(uncommented))["full_minute"]
+
+
+def _example_full_minute_config() -> dict:
+    return {
+        "name": "tushare_full_minute_recipe",
+        "auth": {"type": "none"},
+        "datasets": {"full_minute": _example_full_minute_recipe()},
+    }
+
+
 # ---- 声明不丢: 这是本次的真实故障 ----
 
 
@@ -218,29 +252,57 @@ def test_intraday_batch_window_covers_whole_day(monkeypatch, tmp_path):
     assert [len(item["symbols"]) for item in captured] == [20, 20, 5]
 
 
-# ---- 随仓示例: Tushare 的 full_minute 段必须与接口上限自洽 ----
+# ---- 随仓示例: Tushare **没有**全市场分钟端点, full_minute 段必须默认不生效 ----
 
 
-def test_shipped_tushare_example_declares_full_minute():
+def test_shipped_tushare_example_leaves_full_minute_disabled():
+    """Tushare 无全市场分钟端点(rt_min 必填 ts_code 且无 trade_time、rt_min_daily 40203),
+    随仓示例不得默认声明 full_minute —— 否则用户会误以为拿到了原生的全量能力。"""
     config = load_config(EXAMPLE_YAML)
     provider = GenericHTTPProvider(config)
     try:
         assert provider.validate() == []
-        assert "full_minute" in provider.config.datasets
+        assert "full_minute" not in config.datasets
+        assert sorted(config.datasets) == ["adj_factor", "daily", "financial", "minute"]
+    finally:
+        provider.close()
+
+
+def test_shipped_example_documents_why_full_minute_is_off():
+    """注释掉可以, 但不能不说原因 —— 上游事实与代价必须写在示例里, 否则下一个人会再打开它。"""
+    text = EXAMPLE_YAML.read_text(encoding="utf-8")
+
+    assert "# full_minute:" in text          # recipe 留着, 取消注释即可用
+    for fact in ("rt_min", "40203", "全市场", "279"):
+        assert fact in text, f"示例注释缺关键事实: {fact}"
+
+
+def test_shipped_tushare_example_batch_fits_row_cap():
+    """batch × 单日 241 根 必须留在 8000 行内: stk_mins 超限是静默截断且丢最旧。"""
+    section = load_config(EXAMPLE_YAML).datasets["minute"]
+
+    assert section.batch * _BARS_PER_DAY <= _TUSHARE_ROW_CAP
+
+
+def test_commented_full_minute_recipe_batch_fits_row_cap():
+    """注释里的 recipe 也守同一上限: 取消注释后不能踩静默截断。"""
+    section = _example_full_minute_recipe()
+
+    assert section["batch"] * _BARS_PER_DAY <= _TUSHARE_ROW_CAP
+
+
+def test_commented_full_minute_recipe_is_valid_when_enabled():
+    """「默认关」不等于「坏了」: recipe 取消注释后必须能过真实加载与校验。"""
+    config = config_from_dict(_example_full_minute_config())
+    provider = GenericHTTPProvider(config)
+    try:
+        assert provider.validate() == []
         section = config.datasets["full_minute"]
         assert section.body["api_name"] == "stk_mins"
         assert section.body["params"]["freq"] == "1min"
         assert section.body["params"]["ts_code"] == "${symbols}"
     finally:
         provider.close()
-
-
-@pytest.mark.parametrize("dataset", ["minute", "full_minute"])
-def test_shipped_tushare_example_batch_fits_row_cap(dataset):
-    """batch × 单日 241 根 必须留在 8000 行内: stk_mins 超限是静默截断且丢最旧。"""
-    section = load_config(EXAMPLE_YAML).datasets[dataset]
-
-    assert section.batch * _BARS_PER_DAY <= _TUSHARE_ROW_CAP
 
 
 def test_shipped_example_full_minute_returns_canonical_minute_frame(monkeypatch):
@@ -256,7 +318,7 @@ def test_shipped_example_full_minute_returns_canonical_minute_frame(monkeypatch)
         },
     }
     provider, sent = _provider(
-        monkeypatch, {"name": "x", "auth": {"type": "none"}, **_example_datasets()},
+        monkeypatch, _example_full_minute_config(),
         lambda _: httpx.Response(200, json=payload),
     )
 
@@ -268,15 +330,8 @@ def test_shipped_example_full_minute_returns_canonical_minute_frame(monkeypatch)
     assert sent[0]["body"]["api_name"] == "stk_mins"
 
 
-def _example_datasets() -> dict:
-    import yaml
-
-    raw = yaml.safe_load(EXAMPLE_YAML.read_text(encoding="utf-8"))
-    return {"datasets": raw["datasets"]}
-
-
 def test_example_full_minute_requires_all_minute_columns():
-    config = load_config(EXAMPLE_YAML)
+    recipe = _example_full_minute_recipe()
 
-    mapped = set(config.datasets["full_minute"].field_map.values())
+    mapped = set(recipe["field_map"].values())
     assert set(_MINUTE_FIELDS) <= mapped
