@@ -12,7 +12,11 @@
   - financial    财务五表(股本除外): 三表多期序列 + 指标单期, 字段映射为 TickFlow
                  canonical 列名, 扶摇独有字段原名透传为扩展列; bps 由估值 pb_mrq
                  反推; shares 无上游接口恒空
-未声明 minute → provider_has_dataset 为 False, 自动回退 tickflow。
+  - full_minute  盘中全市场当日分钟K: **用全市场快照轮询合成** (上游没有分钟端点,
+                 见 minute_synth 模块 docstring 的实测结论)。按仅修复轮语义运行:
+                 每轮 1 请求(全市场快照) → 增量还原分钟K → 服务每轮幂等合并落盘。
+未声明 minute → provider_has_dataset 为 False, 自动回退 tickflow(分时/分钟回测
+仍走 TickFlow; 扶摇无任何按标的分钟端点)。
 
 单位与口径 (CONTRIBUTING §3.1, 不可凭字段名推断):
   - 扶摇 price_change_ratio_pct 为百分数数值 (1.74 = +1.74%), 本项目 realtime
@@ -43,12 +47,13 @@ import pyarrow.parquet as pq
 from app.data_providers.normalizer import DAILY_COLS, normalize_daily
 from app.indicators.pipeline import filter_halt_days
 from app.plugins.fuyao import client as fuyao_client
+from app.plugins.fuyao import minute_synth
 from app.plugins.fuyao.client import FuyaoClient, FuyaoError
 
 logger = logging.getLogger(__name__)
 
 # 只声明真实提供的数据集; 其余数据集 provider_has_dataset 返回 False → 回退 tickflow
-_DATASETS = ("realtime", "daily", "adj_factor", "financial")
+_DATASETS = ("realtime", "daily", "adj_factor", "financial", "full_minute")
 
 API_KEY_ENV = "FUYAO_API_KEY"
 SECRETS_FIELD = "fuyao_api_key"  # UI 配置的 Key 存 secrets.json, 优先级高于 .env
@@ -72,6 +77,17 @@ _RECENT_DUMP_DAYS = 12  # 窗口跨度 ≤ 此天数时优先走 10d dump(覆盖
 _PREV_CLOSE_BACKDAYS = 30  # 推导因子时向前找"除权日前收盘"的回看天数(容忍长期停牌)
 _DAILY_DUMP_BATCH_ROWS = 100_000
 _HIST_SYMBOL_BATCH = 50
+# 全量分钟合成帧的 canonical 列 (与 CANONICAL_MINUTE_COLS 同形同序)
+_MINUTE_SCHEMA = {
+    "symbol": pl.Utf8,
+    "datetime": pl.Datetime("us"),
+    "open": pl.Float64,
+    "high": pl.Float64,
+    "low": pl.Float64,
+    "close": pl.Float64,
+    "volume": pl.Float64,
+    "amount": pl.Float64,
+}
 _DAILY_DUMP_COLUMNS = [
     "thscode", "adjusted", "date_ms", "open_price", "high_price", "low_price",
     "close_price", "volume", "turnover",
@@ -302,6 +318,11 @@ def _map_snapshot_row(row: dict, fetched_ms: int, *, volume_to_hand: bool = True
     }
 
 
+def _empty_minute_frame() -> pl.DataFrame:
+    """空分钟帧: 显式 canonical 列, 避免下游拿到无列的空 df。"""
+    return pl.DataFrame(schema=_MINUTE_SCHEMA)
+
+
 class FuyaoProvider:
     """扶摇数据源。realtime = A 股全市场快照(quote_service 全市场模式轮询调用)。"""
 
@@ -313,6 +334,8 @@ class FuyaoProvider:
         self._client: FuyaoClient | None = None
         self._dump_memo: dict[str, pl.DataFrame] = {}
         self._dump_path_memo: dict[str, Path] = {}
+        # 全量分钟: 快照轮询 → 分钟K 的合成状态(进程内单例, 与 service 共享)
+        self._minute_synth = minute_synth.SnapshotMinuteSynthesizer()
 
     def close(self) -> None:  # loader.load_all 重建注册表时会对每个 provider 调 close
         if self._client is not None:
@@ -321,6 +344,7 @@ class FuyaoProvider:
             self._client = None
         self._dump_memo.clear()
         self._dump_path_memo.clear()
+        self._minute_synth.reset()
 
     def _get_client(self) -> FuyaoClient:
         if self._client is None:
@@ -1112,6 +1136,41 @@ class FuyaoProvider:
             pl.col("close_price").cast(pl.Float64).alias("close"),
         ).filter(pl.col("close").is_not_null())
 
+    # ---- full_minute (全市场快照轮询合成) ----
+    def get_intraday_batch(
+        self, symbols: list[str] | None = None, count: int = 300, asset_type: str = "stock",
+    ) -> pl.DataFrame:
+        """全量分钟取数: 拉一轮全市场快照 → 合成分钟K (1 请求/轮)。
+
+        本源**只实现** get_intraday_batch, 不实现 get_intraday_latest: 上游没有
+        "每只最新 N 根"的廉价端点, 本源每轮本身就是一次全市场快照轮询(5575 行)
+        → minute_refresh 自动按**仅修复轮**调度(节奏下限 60s)。这既是上游友好的
+        选择(6s 节奏 = 10 请求/分钟)也正好是快照合成"每分钟一次采样"的上限。
+
+        产出为**保留窗口内的全部桶**(≤ KEEP_BUCKETS 根/标的, 每轮重发供幂等合并):
+        close/open 是真实采样价, high/low 为采样近似, 冷启动与断档的分钟不产出。
+        失败返回空帧(由服务按空轮处理), 不抛异常。
+        """
+        now = minute_synth.now_wallclock()
+        try:
+            rows, server_ts = self._get_client().snapshot_all()
+        except FuyaoError as e:
+            logger.warning("扶摇全量分钟: 全市场快照拉取失败: %s", e)
+            return _empty_minute_frame()
+        bars = self._minute_synth.update(
+            rows, now, server_ts=server_ts, symbols=symbols, max_buckets=count,
+        )
+        if not bars:
+            return _empty_minute_frame()
+        df = pl.DataFrame(bars, infer_schema_length=None).select(
+            [pl.col(name).cast(dtype, strict=False) for name, dtype in _MINUTE_SCHEMA.items()]
+        )
+        logger.info(
+            "扶摇全量分钟: 快照 %d 行 → 合成 %d 根分钟K (%d 标的)",
+            len(rows), df.height, df["symbol"].n_unique(),
+        )
+        return df
+
     # ---- 测试(设置页试拉) ----
     def test_dataset(self, dataset: str, symbols: list[str] | None = None) -> dict:
         if dataset in ("daily", "adj_factor"):
@@ -1150,6 +1209,28 @@ class FuyaoProvider:
                 "rows": df.height,
                 "columns": df.columns,
                 "preview": head,
+            }
+        if dataset == "full_minute":
+            # 全市场口径(快照本身是全市场单请求, 不受 symbols 过滤影响)
+            df = self.get_intraday_batch(count=3)
+            head = df.head(5).to_dicts()
+            for row in head:  # datetime → ISO 字符串, 保证 JSON 可序列化
+                for k, v in list(row.items()):
+                    if isinstance(v, (date, datetime)):
+                        row[k] = v.isoformat()
+            stats = self._minute_synth.stats()
+            return {
+                "provider": self.name,
+                "dataset": dataset,
+                "rows": df.height,
+                "columns": df.columns,
+                "preview": head,
+                "note": (
+                    "由全市场快照轮询合成(上游无分钟端点): close/open 为真实采样价, "
+                    "high/low 为采样近似, 冷启动与断档的分钟不产出。服务按仅修复轮调度"
+                    "(节奏下限 60s); 首次调用只建立基线(0 行)。当前跟踪 "
+                    f"{stats['tracked']} 标的 / {stats['buckets']} 根。"
+                ),
             }
         if dataset != "realtime":
             return {
