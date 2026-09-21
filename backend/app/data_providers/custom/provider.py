@@ -378,8 +378,8 @@ class GenericHTTPProvider:
         custom 源用一个 'financial' dataset 配置覆盖全部财务表; 请求时把 table 作为参数传给上游,
         上游根据 table 返回对应数据。字段由数据源决定, 这里只确保有 symbol 列。
         内部表名 → 上游取值由 `table_map` 映射(如 metrics→fina_indicator); 声明了 table_map
-        时它就是**支持范围**: 未声明的表直接跳过(如 Tushare 的 shares 只能按交易日取、
-        单标的 6000 行, 默认不开)。
+        时它就是**支持范围**: 未声明的表直接跳过(例如某源的股本只有按交易日的快照、
+        单标的数千行, 不适合每轮全量同步, 就默认不开)。
         """
         cfg = self._dataset("financial")
         if cfg.table_map and table not in cfg.table_map:

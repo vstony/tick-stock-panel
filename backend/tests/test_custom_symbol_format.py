@@ -1,6 +1,6 @@
 """标的格式契约: `600000.SH` 这种「6 位代码.交易所大写后缀」是全局唯一格式。
 
-实测(见 docs/examples/tushare.yaml 注释): Tushare 对 600000 / sh600000 / 600000.XSHG /
+实测(见 app/plugins/tushare/provider.py 注释): Tushare 对 600000 / sh600000 / 600000.XSHG /
 600000.sz 全部返回 `code=0` **但 0 行** —— 静默无数据, 不报错。内部落盘/JOIN 也按该格式
 对齐, 所以:
   1. 映射出的 symbol 不合格式时必须告警(否则"0 行"无从查起);

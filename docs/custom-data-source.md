@@ -12,7 +12,7 @@
 | 除权因子 | `adj_factor` | 批量返回一组股票的复权因子 |
 | 实时行情 | `realtime` | 返回全市场快照,用于盘中 enriched 增量计算 |
 | 分钟K | `minute` | 返回 1m 分钟K(需映射出 symbol / datetime / OHLC / 量额) |
-| 全量分钟 | `full_minute` | 与 `minute` 同形;声明后可被路由为「全量分钟」生效源,内置服务盘中按当日窗口全市场批量落盘(仅修复轮语义,节奏下限 60s)。**要求上游能低成本提供全市场数据**: 每轮会把全市场标的都拉一遍, 纯按标的的源(如 Tushare)代价较高, 见下 |
+| 全量分钟 | `full_minute` | 与 `minute` 同形;声明后可被路由为「全量分钟」生效源,内置服务盘中按当日窗口全市场批量落盘(仅修复轮语义,节奏下限 60s)。**要求上游能低成本提供全市场数据**: 每轮会把全市场标的都拉一遍, 只能按标的拉的上游代价很高, 见下 |
 | 财务数据 | `financial` | 一个配置覆盖内部 5 张财务表(`metrics`/`income`/`balance_sheet`/`cash_flow`/`shares`),用 `table_map` 把内部表名映射到上游接口名 |
 
 深度盘口(depth5)暂无数据集契约,仍由 TickFlow 提供。
@@ -24,7 +24,7 @@
 > **上游需要真·全市场数据**: `full_minute` 每轮都把全市场标的拉一遍(用 `batch` 分块)。
 > 上游若有「一次回全市场」的端点(如 TickFlow `intraday.universe`、插件实现
 > `get_intraday_latest`)则代价低;纯按标的的源只能靠批量循环**模拟**, 一轮请求数 =
-> 标的数 / `batch`(实测 Tushare 全市场 ≈ 5568 标的 / 20 ≈ 279 请求/轮), 且每轮重拉当日全量。
+> 标的数 / `batch`(以全市场 ≈ 5568 标的、`batch` 20 计 ≈ 279 请求/轮), 且每轮重拉当日全量。
 > 选源时先确认这个代价可以接受。
 
 > **声明 ≠ 生效**: 声明 datasets 只是让该源进入对应能力的**候选列表**, 真正生效还需在
@@ -33,7 +33,7 @@
 > 「未接入 · 可切到 X」, 点一下即可; 候选为空才是真的没有源提供。
 
 > 单请求行数上限是**静默截断**(不是报错、不翻页): 超出时上游只回前 N 条且丢最旧数据。
-> 例如 Tushare `stk_mins` 硬上限 8000 行 —— 20 标的跨 2 日应回 9640 行, 实测恰好 8000 行、
+> 实测某上游 `stk_mins` 硬上限 8000 行 —— 20 标的跨 2 日应回 9640 行, 实测恰好 8000 行、
 > 且只剩后一天。因此 `batch` 必须按「单标的行数 × 窗口内天数」折算: 全量分钟只拉当日
 > (241 根/股) 可以取 20, 多日历史分钟请调小 batch 或按交易日拆成多轮调用。
 
@@ -328,34 +328,36 @@ datasets:
   约 70 分钟。所以「已同步 0/5 张表…」会持续十几分钟才跳到 1/5; 只想看核心指标时用**单表同步**更快。
   想缩短时间只能提高 `rpm`, 上限是上游配额(Tushare 财务接口实测 500 次/分钟, 超限返回 `code=40203`)。
 
-### 完整示例: Tushare(纯 YAML 接入)
+### 完整示例(token 进请求体 + 业务参数嵌套 + 财务表映射)
 
-仓内 `docs/examples/tushare.yaml` 是可直接复用的完整配置(日K / 除权因子 / 分钟K / 财务四表;
-全量分钟段**默认注释掉**, 原因见下), 拷到 `data/data_sources/` 并在 `.env` 配 `TUSHARE_API_KEY` 即可:
+覆盖「token 在请求体 / 业务参数嵌套在 params / 时间占位符 / `${table}` 多表映射」的骨架,
+把 `url` 与字段名换成你要接的厂商实测值即可(可本地跑通的 mock 示例见
+[docs/examples/custom-data-source](./examples/custom-data-source/README.md): `mock_server.py` + `mock_source.yaml`):
 
 ```yaml
+name: my_http_api
+display_name: "My HTTP 数据源"
 auth:
-  type: body            # token 进 POST 请求体(参数名 token)
-  param: token
-  token_env: TUSHARE_API_KEY
+  type: body            # token 进 POST 请求体(参数名默认 token)
+  token_env: MY_HTTP_TOKEN
 
 datasets:
   daily:
-    url: http://api.tushare.pro
+    url: https://api.example.com/v1/kline
     method: POST
-    batch: 20            # 接口单次 6000 行上限, 按窗口交易日数留余量
+    batch: 20            # 有行数上限时: 单标的行数 × 窗口交易日数 ≤ 上限
     rpm: 240
-    response_path: data  # 列式信封由本项目解包
+    response_path: data  # 列式信封 {fields, items} 由本项目按字段名解包
     body:
-      api_name: daily
-      fields: "ts_code,trade_date,open,high,low,close,vol,amount"
+      method: kline.daily
+      fields: "code,date,open,high,low,close,vol,amount"
       params:
-        ts_code: "${symbols}"
+        codes: "${symbols}"                 # 逗号串(见「请求模板」)
         start_date: "${start:%Y%m%d}"
         end_date: "${end:%Y%m%d}"
     field_map:
-      ts_code: symbol
-      trade_date: date
+      code: symbol
+      date: date
       open: open
       high: high
       low: low
@@ -364,40 +366,33 @@ datasets:
       amount: amount
     transforms:
       date: "parse_date(value, '%Y%m%d')"
-      amount: "value * 1000"          # 千元 → 元
+      amount: "value * 1000"                # 上游给千元时必须显式换算
 
   adj_factor:
-    # ...同构: body.api_name=adj_factor + adj_factor_mode: cumulative
+    # ...同构 daily; 上游给累积因子时加 adj_factor_mode: cumulative
   minute:
-    # ...同构: body.api_name=stk_mins, params.freq=1min,
-    # 时间参数用 ${start:%Y-%m-%d %H:%M:%S}, transforms 里 volume: "value / 100"(股→手)
-  full_minute:
-    # ...同构 minute, 但拉的是当日窗口(00:00 → 现在, 北京墙钟)。⚠ Tushare **没有全市场
-    # 分钟端点**, 实测: stk_mins 按标的拉(多标的逗号串有效, 单请求 8000 行上限);
-    # rt_min 必填 ts_code(否则 50101)且返回里没有 trade_time(只有最新一根);
-    # rt_min_daily 本 key 无权限(40203)。所以这里是「按标的批量模拟当日全市场」:
-    # 全市场 ≈ 5568 标的 / batch 20 ≈ 279 请求/轮(≈70s @rpm 240), 且 YAML 源无
-    # get_intraday_latest 增量端点 → 只能走仅修复轮(节奏下限 60s, 每轮重拉当日全量)。
-    # 因此随仓示例默认不声明该段(需手动取消注释 + 在「数据源 → 全量分钟」选源);
-    # 想要低成本持续全量分钟请用 TickFlow Expert 的 intraday.universe, 或写插件实现
-    # get_intraday_latest。详见仓内 docs/examples/tushare.yaml 该段注释。
+    # ...同构 daily; 时间参数用 ${start:%Y-%m-%d %H:%M:%S},
+    # volume 单位是股时用 transforms: volume: "value / 100"(股→手)
   financial:
-    # ...同构: table_map 把 4 张内部表映射到 fina_indicator/income/balancesheet/cashflow,
-    # body.api_name="${table}", 比率保持百分数、金额保持元、股本万股→股
+    # ...同构 daily; 用 table_map 把内部表名映射到上游接口名,
+    # 请求模板里用 ${table} 注入(见「财务数据集: 表名映射与单位」)
 ```
 
-覆盖范围与注意: 日K仅 A 股(`daily`)——ETF/指数日K需换 `fund_daily`/`index_daily` 接口, 而一个数据集
-只能有一个 url/body 模板, 故这两个数据集的日K请路由到 TickFlow(或另写一个插件);
-分钟K(`stk_mins`)对股票/ETF/指数通用, 但**只能按标的拉**, Tushare 没有全市场分钟端点
-(`rt_min` 必填 `ts_code` 且返回无 `trade_time`, `rt_min_daily` 无权限), 所以「全量分钟」在 Tushare 上
-只是按标的批量模拟(≈279 请求/轮), 示例里默认注释掉。
-财务只覆盖**内部真实消费**的 4 张表(`metrics`/`income`/`balance_sheet`/`cash_flow`);
-上游另外那些接口(业绩预告/快报、分红送股、审计意见、主营构成、披露计划等)与本项目数据模型
-**没有下游消费方**: 没有对应数据集、服务、因子或页面, 接进来也只会落一堆无人读的 parquet。
-需要它们时先加内部表契约与消费方(因子/页面), 再在 `table_map` 里加一行映射。
-历史股本(`shares`)同样默认不开: 上游只有按交易日的股本(单标的数千行), 默认全 A 同步代价过高;
-需要时给 `table_map` 加 `shares: daily_basic` 一行即可(YAML 已备好 `trade_date`→`period_end`、
-`float_share`(万股)→`float_shares`(股))。
+覆盖范围与注意:
+- **一个数据集只有一个 url/body 模板**: 同一数据集若需按资产类型换接口(如 A 股 / ETF / 指数
+  各一个端点), 请把该数据集路由到其它源, 或另写插件(插件可在 provider 内按 asset_type 分流)。
+- 财务只覆盖**内部真实消费**的 4 张表(`metrics`/`income`/`balance_sheet`/`cash_flow`):
+  上游那些没有下游消费方的接口(业绩预告/快报、分红送股、审计意见、主营构成等)接进来
+  只会落一堆无人读的 parquet。需要时先在项目侧加内部表契约与消费方(因子/页面), 再在
+  `table_map` 里加一行映射。
+- 历史股本(`shares`)默认也可以不开: 上游常只有按交易日的股本(单标的数千行), 全市场同步代价高;
+  需要时给 `table_map` 加一行, 并在 `field_map` 里处理单位(常见「万股 → 股」)。
+- `full_minute` 见上文「上游需要真·全市场数据」: 纯按标的追加批量的源代价高,
+  且声明式源没有 `get_intraday_latest`, 只能走仅修复轮。
+
+> **Tushare Pro 已改为内置插件接入**(`backend/app/plugins/tushare/`, 见
+> [plugin-development.md](./plugin-development.md)): 插件能在 provider 内按 asset_type 分流接口、
+> 处理累积因子换算与财务多表映射, 比 YAML 模板表达力更强。本文档保留的是**通用**接入方式。
 
 > `body` / `params` / `table_map` / `adj_factor_mode` 没有设置页表单控件, 但会在配置回填与保存时
 > **原样保留**; 修改这几项请直接编辑 `data/data_sources/*.yaml` 后点「重新加载」。
@@ -430,7 +425,7 @@ auth:
 auth:
   type: body            # Token 注入 POST 请求体(参数名 param, 默认 token)
   param: token
-  token_env: TUSHARE_API_KEY
+  token_env: MY_HTTP_TOKEN
 ```
 
 Token 可以放在系统环境变量或项目 `.env` 中。`type: body` 只适用于 POST 数据集(否则配置校验报错);

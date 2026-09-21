@@ -357,7 +357,7 @@ flowchart TB
 | **后端** | ![Python](https://img.shields.io/badge/Python_3.11+-3776AB?logo=python&logoColor=white) ![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white) ![Pydantic](https://img.shields.io/badge/Pydantic_v2-E92063?logo=pydantic&logoColor=white) APScheduler · sse-starlette |
 | **数据** | ![Polars](https://img.shields.io/badge/Polars-CD882D?logo=polars&logoColor=white)（计算）· ![DuckDB](https://img.shields.io/badge/DuckDB-FFF100?logo=duckdb&logoColor=black)（查询）· Parquet（存储） |
 | **回测** | 自研仓位模拟引擎(T+1/费用/滑点/分钟回放)· vectorbt(部分路径) |
-| **数据源** | [TickFlow](https://tickflow.org/auth/register?ref=V3KDKGXPEA) 官方 SDK · fuyao(同花顺 REST) · [Tushare Pro](https://tushare.pro)(HTTP,日K/除权因子/分钟K) · 插件化扩展(stock-sdk 示例插件 · YAML 自定义源) |
+| **数据源** | [TickFlow](https://tickflow.org/auth/register?ref=V3KDKGXPEA) 官方 SDK · fuyao(同花顺 REST) · [Tushare Pro](https://tushare.pro)(HTTP, 日K/除权因子/分钟K/财务四表/标的维表) · 插件化扩展(stock-sdk 示例插件 · YAML 自定义源) |
 | **AI**(可选) | ![OpenAI兼容](https://img.shields.io/badge/OpenAI兼容-412991?logo=openai&logoColor=white) DeepSeek / 通义 / Ollama 等 · 策略生成 / 报告 / **对话助手**(助手依赖工具调用能力, 需 OpenAI 兼容接口) |
 | **前端** | ![React 18](https://img.shields.io/badge/React_18-61DAFB?logo=react&logoColor=black) ![Vite](https://img.shields.io/badge/Vite-646CFF?logo=vite&logoColor=white) ![TypeScript](https://img.shields.io/badge/TypeScript-3178C6?logo=typescript&logoColor=white) ![Tailwind](https://img.shields.io/badge/Tailwind-06B6D4?logo=tailwindcss&logoColor=white) Tanstack Query · [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)(TradingView 开源) · ![ECharts](https://img.shields.io/badge/ECharts-AA344D?logo=apacheecharts&logoColor=white) · dnd-kit |
 | **部署** | ![Docker](https://img.shields.io/badge/Docker_单容器-2496ED?logo=docker&logoColor=white) 两阶段构建,前端 dist 拷进后端镜像 |
@@ -545,7 +545,7 @@ PORT=3018                      # 服务端口
 
 内置数据源插件 [fuyao](https://fuyao.aicubes.cn/docs/api-reference/) 提供同花顺 REST 数据接口(行情 / 财务 / 龙虎榜 / 盘前风向标 / 交易日历等),需自备 API Key,使用前请遵守其服务条款
 
-数据源示例 [Tushare Pro](https://tushare.pro) 以纯 YAML 自定义源接入(A 股日K / 除权因子 / 分钟K / 财务四表,见 [docs/examples/tushare.yaml](./docs/examples/tushare.yaml),接口按积分等级限频),需自备 API Key,使用前请遵守其服务条款。注意 Tushare **没有全市场分钟端点**(`stk_mins` 按标的、`rt_min` 必填 `ts_code` 且无 `trade_time`、`rt_min_daily` 无权限),故示例中的 `full_minute` 段默认注释掉;要持续跑全量分钟请用 TickFlow Expert 档或自写插件
+内置数据源插件 [Tushare Pro](https://tushare.pro) 提供 A 股 / ETF / 指数日K、除权因子、分钟K、财务四表与标的维表(接口按积分等级限频,插件侧自限速 400 次/分钟),需自备 API Key,使用前请遵守其服务条款。Tushare **没有全市场分钟端点**(`stk_mins` 只能按标的拉、`rt_min` 必填 `ts_code` 且无 `trade_time`、`rt_min_daily` 无权限),故不提供「全量分钟」能力;需要时请用 TickFlow Expert 档
 
 数据源插件 [stock-sdk](https://stock-sdk.linkdiary.cn) 遵循其各自的 ISC 协议。
 
