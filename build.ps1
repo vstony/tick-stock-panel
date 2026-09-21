@@ -5,6 +5,7 @@
 
 .DESCRIPTION
     菜单式入口, 默认第 0 项 = 一键全流程(在线更新 → 条件编译 → 本地运行)。
+    位置参数可直接写菜单编号: `\build.ps1 0` 等价于在菜单里按 0(不打印菜单)。
 
     - 在线更新: git fetch + fast-forward pull; 更新前把「已跟踪文件的本地改动」用
       git stash 暂存, 更新后自动恢复。未跟踪文件、data/、node_modules/ 等忽略项不受影响。
@@ -14,10 +15,19 @@
       frontend/dist)。
 
 .PARAMETER Task
-    menu(默认, 交互菜单) | all(一键全流程) | update | build | run | deps | test | status | clean
+    菜单编号(位置参数, 推荐):
+        0=一键全流程  1=在线更新  2=条件编译  3=本地运行  4=同步依赖
+        5=运行测试    6=清理产物  7=状态检查  q=退出(不执行)
+    也可写任务名: menu(默认, 交互菜单) | all | update | build | run | deps | test | status | clean。
+    编号 2/3 会直接执行该步动作(条件编译 / 本地运行, 用 -BackendExtras / -RunMode 控制),
+    不会像菜单那样再弹子菜单; 需要交互改配置时直接运行 `\build.ps1`(无参数)
 
 .PARAMETER BackendExtras
-    后端可选依赖 extras, 空格分隔, 如 'legacy-cpu' / 'legacy-cpu backtest'。
+    后端可选依赖 extras(注意是 extra 名, 不是包名), 空格/逗号分隔,
+    如 'legacy-cpu' / 'legacy-cpu backtest'。
+    可用值以 backend/pyproject.toml 的 [project.optional-dependencies] 为准:
+    legacy-cpu(旧 CPU 兼容内核) / backtest(回测引擎, 含 vectorbt) / desktop(桌面壳, 含 pywebview) / dev(测试工具)。
+    传已知包名会自动纠正(如 vectorbt → backtest); 其余未知值直接报错并列出可用项。
 
 .PARAMETER RunMode
     dev(默认, 前后端双端口热更新) | prod(单端口, 需先编译前端)。
@@ -49,8 +59,20 @@
     菜单模式, 选 0 执行一键全流程。
 
 .EXAMPLE
+    .\build.ps1 0
+    位置参数直达菜单第 0 项: 一键全流程(更新 → 编译 → 运行), 不打印菜单。
+
+.EXAMPLE
+    .\build.ps1 2 -BackendExtras 'legacy-cpu backtest' -PackageDesktop -Yes
+    位置参数直达第 2 项(条件编译), 并指定 extras 与桌面打包。
+
+.EXAMPLE
+    .\build.ps1 3 -RunMode prod
+    位置参数直达第 3 项(本地运行), 生产模式单端口启动。
+
+.EXAMPLE
     .\build.ps1 -Task all -Yes
-    非交互一键全流程: 更新 → 同步依赖 → 编译前端 → 启动开发模式。
+    等价写法(任务名): 非交互一键全流程。
 
 .EXAMPLE
     .\build.ps1 -Task build -BackendExtras 'legacy-cpu backtest' -PackageDesktop -Yes
@@ -69,7 +91,10 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('menu', 'all', 'update', 'build', 'run', 'deps', 'test', 'status', 'clean')]
+    # 位置参数: 菜单编号(0-7/q) 或 任务名(menu/all/update/build/run/deps/test/status/clean)
+    [ValidateSet('menu', 'all', 'update', 'build', 'run', 'deps', 'test', 'status', 'clean',
+        '0', '1', '2', '3', '4', '5', '6', '7', 'q')]
+    [Parameter(Position = 0)]
     [string]$Task = 'menu',
 
     [string]$BackendExtras = '',
@@ -338,10 +363,19 @@ function Show-Status {
     Write-Host ("  依赖       : backend/.venv {0} | frontend/node_modules {1}" -f `
         $(if ($venv) { '已就绪' } else { '缺失' }), $(if ($modules) { '已就绪' } else { '缺失' }))
 
+    # 产物分两类: 前端 dist 是生产模式/桌面包的必需产物, 桌面包(backend/dist)是可选产物。
+    # 默认不打包时它不存在属正常, 所以两者分开措辞 —— 别让「没打包」看起来像「故障」。
     $distOk = Test-Path (Join-Path $FrontendDist 'index.html')
+    Write-Host ("  产物       : 前端 frontend/dist {0}" -f `
+        $(if ($distOk) { '已构建' } else { '未构建(dev 模式不需要; prod 模式与桌面打包需要先编译)' }))
     $deskOk = Test-Path (Join-Path $DesktopDist 'TickFlowStockPanel')
-    Write-Host ("  产物       : frontend/dist {0} | backend/dist/TickFlowStockPanel {1}" -f `
-        $(if ($distOk) { '存在' } else { '缺失' }), $(if ($deskOk) { '存在' } else { '缺失' }))
+    if ($deskOk) {
+        Write-Host '              桌面客户端 已打包 (backend/dist/TickFlowStockPanel)'
+    } elseif ($script:Cfg.PackageDesktop) {
+        Write-Host '              桌面客户端 未打包 — 本次已开启打包, 编译阶段会生成' -ForegroundColor Yellow
+    } else {
+        Write-Host '              桌面客户端 未打包(可选产物; 需要时加 -PackageDesktop 或用菜单 2)' -ForegroundColor DarkGray
+    }
 
     if (Test-Path $EnvFile) {
         $tf = if (Read-DotEnvValue $EnvFile 'TICKFLOW_API_KEY') { '已设置' } else { '未设置' }
@@ -513,6 +547,56 @@ function Show-EnvKeyDiff {
 }
 
 # ============================== 任务: 依赖同步 ==============================
+# 从 backend/pyproject.toml 读 [project.optional-dependencies] 的真实 extra 名。
+# 用途: 校验用户输入 —— 把包名(如 vectorbt)当 extra 名传下去, uv 会报
+# "Extra `vectorbt` is not defined" 这种底层错误, 提前拦下并给出可用列表。
+function Get-AvailableExtras {
+    $pyproject = Join-Path $BackendDir 'pyproject.toml'
+    if (-not (Test-Path $pyproject)) { return @() }
+    $keys = @()
+    $inSection = $false
+    foreach ($line in Get-Content $pyproject) {
+        if ($line -match '^\s*\[') {
+            $inSection = ($line -match '^\s*\[project\.optional-dependencies\]')
+            continue
+        }
+        if ($inSection -and $line -match '^\s*([A-Za-z0-9_.\-]+)\s*=\s*\[') { $keys += $Matches[1].ToLower() }
+    }
+    return $keys
+}
+
+# 规范化 + 校验 extras。只在「包名与 extra 一一对应」时才自动纠正
+# (vectorbt↔backtest), 有歧义的输入一律报错并列出可用项, 不瞎猜。
+function Resolve-BackendExtras([string]$Raw) {
+    $items = @($Raw -split '[\s,]+' | Where-Object { $_ })
+    if ($items.Count -eq 0) { return '' }
+
+    $available = @(Get-AvailableExtras)
+    if ($available.Count -eq 0) {
+        Write-Warn '未能从 backend/pyproject.toml 读到 extras 列表, 跳过校验'
+        return (($items | ForEach-Object { $_.Trim().ToLower() }) -join ' ')
+    }
+
+    $aliases = @{
+        'vectorbt' = 'backtest'   # backtest extra 里只装 vectorbt
+        'pywebview' = 'desktop'   # desktop extra 里只装 pywebview
+        'webview' = 'desktop'
+        'rtcompat' = 'legacy-cpu' # legacy-cpu 装的是 polars[rtcompat]
+    }
+    $resolved = @()
+    foreach ($item in $items) {
+        $key = $item.Trim().ToLower()
+        if ($available -contains $key) { $resolved += $key; continue }
+        if ($aliases.ContainsKey($key) -and ($available -contains $aliases[$key])) {
+            Write-Warn "'$key' 是包名, 已按 extra 名 '$($aliases[$key])' 处理"
+            $resolved += $aliases[$key]
+            continue
+        }
+        Stop-Fatal ("未知 extra '$item'。可用 extras: {0}。注意这里要填 extra 名而不是包名(回测引擎的 extra 叫 backtest, vectorbt 是它内部的依赖)。" -f ($available -join ', '))
+    }
+    return (($resolved | Select-Object -Unique) -join ' ')
+}
+
 function Sync-Deps {
     param([switch]$Force)
 
@@ -520,6 +604,8 @@ function Sync-Deps {
     Require-Command 'uv' 'powershell -c "irm https://astral.sh/uv/install.ps1 | iex"'
     Require-Command 'pnpm' 'npm i -g pnpm'
 
+    # 菜单改配置 / 外部改 pyproject 后都可能失效, 这里再兜一次校验
+    $script:Cfg.BackendExtras = Resolve-BackendExtras $script:Cfg.BackendExtras
     $extras = ($script:Cfg.BackendExtras -split '\s+' | Where-Object { $_ }) -join ' '
     $venv = Join-Path $BackendDir '.venv'
     $extrasMarker = Join-Path $venv '.tsp-extras'
@@ -536,8 +622,13 @@ function Sync-Deps {
         Push-Location $BackendDir
         try {
             Write-Info "→ $label"
-            & uv @syncArgs 2>&1 | ForEach-Object { Write-Host "    $_" }
+            # 边流式输出边留底: 需要区分「extras 写错」与「锁文件不一致」, 只有后者该退回非 frozen 重试
+            $syncLog = New-Object System.Collections.Generic.List[string]
+            & uv @syncArgs 2>&1 | ForEach-Object { $syncLog.Add([string]$_) ; Write-Host "    $_" }
             $code = $LASTEXITCODE
+            if ($code -ne 0 -and (($syncLog -join "`n") -match 'is not defined in the project')) {
+                Stop-Fatal ("uv sync 不接受这些 extras: [{0}]。可用 extras: {1}" -f $extras, ((Get-AvailableExtras) -join ', '))
+            }
             if ($code -ne 0) {
                 Write-Warn 'uv sync --frozen 失败(锁文件与 pyproject 可能不一致), 退回非 frozen 重试'
                 $retryArgs = @($syncArgs | Where-Object { $_ -ne '--frozen' })
@@ -622,6 +713,11 @@ function Package-Desktop {
 }
 
 function Start-Build {
+    # 直接执行时先把生效的配置打出来, 避免「以为改了 extras/打包开关」的误会
+    Write-Info ("编译配置: extras=[{0}] 前端构建={1} 桌面打包={2}" -f `
+        $(if ($script:Cfg.BackendExtras) { $script:Cfg.BackendExtras } else { '无' }), `
+        $(if ($script:Cfg.SkipFrontendBuild) { '跳过' } else { '开' }), `
+        $(if ($script:Cfg.PackageDesktop) { '开' } else { '关' }))
     if ($SkipDeps) { Write-Info '按参数跳过依赖同步' } else { Sync-Deps }
     Build-Frontend
     if ($script:Cfg.PackageDesktop) { Package-Desktop }
@@ -859,6 +955,7 @@ function Show-MenuOnce {
     Write-Host '  7) 状态检查      工具链 / 依赖 / 产物 / 端口'
     Write-Host '  Q) 退出'
     Write-Host '------------------------------------------------------------'
+    Write-Host '  提示: 也可 .\build.ps1 <编号> 直达某一步(例: .\build.ps1 0)' -ForegroundColor DarkGray
 
     $choice = (Read-Host '请选择 [0-7/Q]').Trim().ToLower()
     switch ($choice) {
@@ -885,14 +982,26 @@ function Edit-BuildConfig {
         Write-Host ("  3) 桌面客户端打包 当前: {0}" -f $(if ($script:Cfg.PackageDesktop) { '开(PyInstaller onedir)' } else { '关' }))
         Write-Host '  4) 执行编译'
         Write-Host '  0) 返回'
-        Write-Host '  extras 说明: legacy-cpu=旧 CPU 兼容内核, backtest=vectorbt 回测引擎, desktop=pywebview 桌面壳'
+        Write-Host ("  可用 extras(取自 pyproject.toml): {0}" -f ((Get-AvailableExtras) -join ', '))
+        Write-Host '  说明: 要填 extra 名而不是包名 —— backtest=回测引擎(内部装 vectorbt), legacy-cpu=旧 CPU 兼容内核(polars[rtcompat]), desktop=桌面壳(pywebview)'
 
         $choice = (Read-Host '请选择 [1-4/0]').Trim()
         switch ($choice) {
             '1' {
-                $rawExtras = (Read-Host '  输入 extras(空格分隔, 直接回车=清空)').Trim()
-                $script:Cfg.BackendExtras = $rawExtras
-                Write-Ok ("后端额外依赖已设为 [{0}]" -f $(if ($rawExtras) { $rawExtras } else { '无' }))
+                $rawExtras = (Read-Host '  输入 extras(空格或逗号分隔, 直接回车=清空)').Trim()
+                if (-not $rawExtras) {
+                    $script:Cfg.BackendExtras = ''
+                    Write-Ok '后端额外依赖已设为 [无]'
+                } else {
+                    try {
+                        # 校验不通过就保留原配置, 不把错误值带进后续编译
+                        $script:Cfg.BackendExtras = Resolve-BackendExtras $rawExtras
+                        Write-Ok ("后端额外依赖已设为 [{0}]" -f $script:Cfg.BackendExtras)
+                    } catch {
+                        Write-Err $_.Exception.Message
+                        Write-Info '已保留原配置, 未改动'
+                    }
+                }
             }
             '2' {
                 $script:Cfg.SkipFrontendBuild = -not $script:Cfg.SkipFrontendBuild
@@ -924,23 +1033,56 @@ function Invoke-Menu {
     while (-not $script:ExitMenu) { Show-MenuOnce }
 }
 
+# 位置参数/任务名 → 内部动作名。编号语义与菜单一致, 但 2/3 直接执行该步动作:
+#   .\build.ps1 0  ≡  菜单里按 0(一键全流程), 不打印菜单也不二次询问。
+function Resolve-TaskAction([string]$Raw) {
+    $key = ''
+    if ($Raw) { $key = $Raw.Trim().ToLower() }
+    switch ($key) {
+        '0'     { return 'all' }
+        '1'     { return 'update' }
+        '2'     { return 'build' }
+        '3'     { return 'run' }
+        '4'     { return 'deps' }
+        '5'     { return 'test' }
+        '6'     { return 'clean' }
+        '7'     { return 'status' }
+        'q'     { return 'quit' }
+        ''      { return 'menu' }
+        default { return $key }
+    }
+}
+
 # ============================== 入口 ==============================
 Ensure-EnvFile
 
-switch ($Task) {
-    'menu' { Invoke-Menu }
-    'all' { Invoke-Guarded '一键全流程' { Invoke-FullFlow } }
-    'update' { Invoke-Guarded '在线更新' { Update-Repo } }
-    'build' { Invoke-Guarded '条件编译' { Start-Build } }
-    'run' { Invoke-Guarded '本地运行' { Start-Local } }
-    'deps' { Invoke-Guarded '同步依赖' { Sync-Deps } }
-    'test' { Invoke-Guarded '运行测试' { Run-Tests } }
-    'status' { Show-Status }
-    'clean' { Clear-Artifacts }
-}
+$action = Resolve-TaskAction $Task
 
-if ($Task -eq 'menu') {
-    Write-Info '已退出菜单'
-} elseif ($script:Failed) {
+# 参数里的 extras 提前校验: 别名自动纠正, 未知值立即报错(不等到编译到一半才炸)
+try {
+    $script:Cfg.BackendExtras = Resolve-BackendExtras $script:Cfg.BackendExtras
+} catch {
+    Write-Err $_.Exception.Message
     exit 1
 }
+
+if ($action -eq 'quit') {
+    Write-Info '未执行任何操作(菜单编号 q = 退出); 需要菜单请直接运行 .\build.ps1'
+} elseif ($action -eq 'menu') {
+    Invoke-Menu
+    Write-Info '已退出菜单'
+} else {
+    switch ($action) {
+        'all'    { Invoke-Guarded '一键全流程' { Invoke-FullFlow } }
+        'update' { Invoke-Guarded '在线更新' { Update-Repo } }
+        'build'  { Invoke-Guarded '条件编译' { Start-Build } }
+        'run'    { Invoke-Guarded '本地运行' { Start-Local } }
+        'deps'   { Invoke-Guarded '同步依赖' { Sync-Deps } }
+        'test'   { Invoke-Guarded '运行测试' { Run-Tests } }
+        'status' { Show-Status }
+        'clean'  { Clear-Artifacts }
+        default  { Write-Err "未知操作: $action"; $script:Failed = $true }
+    }
+}
+
+if ($script:Failed) { exit 1 }
