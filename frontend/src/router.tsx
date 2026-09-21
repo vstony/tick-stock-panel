@@ -1,10 +1,11 @@
-import { lazy } from 'react'
 import { createBrowserRouter, Navigate, useSearchParams } from 'react-router-dom'
 import { Layout } from './components/Layout'
 import { Onboarding } from './pages/Onboarding'
 import { Auth } from './pages/Auth'
 import { useSettings } from './lib/useSharedQueries'
 import { Logo } from './components/Logo'
+import { RouteError } from './components/RouteError'
+import { lazyWithRetry } from './lib/lazyWithRetry'
 import { ExtensionBoundary } from './extensions/ExtensionBoundary'
 import {
   finalizeFrontendExtensions,
@@ -12,31 +13,33 @@ import {
   getFrontendExtensionRoutes,
 } from './extensions/registry'
 
-// 代码分割: 页面全部 lazy 加载, 避免首屏打包所有页面 (ECharts / lightweight-charts /
+// 代码分割: 页面全部懒加载, 避免首屏打包所有页面 (ECharts / lightweight-charts /
 // framer-motion 等重库) → 大幅减小首屏 bundle。命名导出用 .then 映射为 default。
 // Layout / Onboarding / Auth 为应用外壳与入口, 保持同步加载。
-const Watchlist = lazy(() => import('./pages/Watchlist').then(m => ({ default: m.Watchlist })))
-const Screener = lazy(() => import('./pages/Screener').then(m => ({ default: m.Screener })))
-const Backtest = lazy(() => import('./pages/Backtest').then(m => ({ default: m.Backtest })))
-const Factors = lazy(() => import('./pages/Factors').then(m => ({ default: m.Factors })))
-const Financials = lazy(() => import('./pages/Financials').then(m => ({ default: m.Financials })))
-const Data = lazy(() => import('./pages/Data').then(m => ({ default: m.Data })))
-const Monitor = lazy(() => import('./pages/Monitor').then(m => ({ default: m.Monitor })))
-const Lots = lazy(() => import('./pages/Lots').then(m => ({ default: m.Lots })))
-const Dashboard = lazy(() => import('./pages/Dashboard').then(m => ({ default: m.Dashboard })))
-const AnalysisDetail = lazy(() => import('./pages/AnalysisDetail').then(m => ({ default: m.AnalysisDetail })))
-const ConceptAnalysis = lazy(() => import('./pages/ConceptAnalysis').then(m => ({ default: m.ConceptAnalysis })))
-const IndustryAnalysis = lazy(() => import('./pages/IndustryAnalysis').then(m => ({ default: m.IndustryAnalysis })))
-const StockAnalysis = lazy(() => import('./pages/StockAnalysis').then(m => ({ default: m.StockAnalysis })))
-const Signals = lazy(() => import('./pages/Signals').then(m => ({ default: m.Signals })))
-const Review = lazy(() => import('./pages/Review').then(m => ({ default: m.Review })))
-const LimitUpLadder = lazy(() => import('./pages/LimitUpLadder').then(m => ({ default: m.LimitUpLadder })))
-const Indices = lazy(() => import('./pages/Indices').then(m => ({ default: m.Indices })))
-const Branding = lazy(() => import('./pages/Branding').then(m => ({ default: m.Branding })))
-const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.Settings })))
-const Regime = lazy(() => import('./pages/Regime').then(m => ({ default: m.Regime })))
-const AbnormalMoves = lazy(() => import('./pages/AbnormalMoves').then(m => ({ default: m.AbnormalMoves })))
-const Dev = lazy(() => import('./pages/Dev').then(m => ({ default: m.Dev })))
+// 用 lazyWithRetry 而非 React.lazy: 模块图换代(dev server 重启/版本更新)导致 chunk 取不到时
+// 自动刷新一次, 而不是把用户停在错误页。
+const Watchlist = lazyWithRetry(() => import('./pages/Watchlist').then(m => ({ default: m.Watchlist })))
+const Screener = lazyWithRetry(() => import('./pages/Screener').then(m => ({ default: m.Screener })))
+const Backtest = lazyWithRetry(() => import('./pages/Backtest').then(m => ({ default: m.Backtest })))
+const Factors = lazyWithRetry(() => import('./pages/Factors').then(m => ({ default: m.Factors })))
+const Financials = lazyWithRetry(() => import('./pages/Financials').then(m => ({ default: m.Financials })))
+const Data = lazyWithRetry(() => import('./pages/Data').then(m => ({ default: m.Data })))
+const Monitor = lazyWithRetry(() => import('./pages/Monitor').then(m => ({ default: m.Monitor })))
+const Lots = lazyWithRetry(() => import('./pages/Lots').then(m => ({ default: m.Lots })))
+const Dashboard = lazyWithRetry(() => import('./pages/Dashboard').then(m => ({ default: m.Dashboard })))
+const AnalysisDetail = lazyWithRetry(() => import('./pages/AnalysisDetail').then(m => ({ default: m.AnalysisDetail })))
+const ConceptAnalysis = lazyWithRetry(() => import('./pages/ConceptAnalysis').then(m => ({ default: m.ConceptAnalysis })))
+const IndustryAnalysis = lazyWithRetry(() => import('./pages/IndustryAnalysis').then(m => ({ default: m.IndustryAnalysis })))
+const StockAnalysis = lazyWithRetry(() => import('./pages/StockAnalysis').then(m => ({ default: m.StockAnalysis })))
+const Signals = lazyWithRetry(() => import('./pages/Signals').then(m => ({ default: m.Signals })))
+const Review = lazyWithRetry(() => import('./pages/Review').then(m => ({ default: m.Review })))
+const LimitUpLadder = lazyWithRetry(() => import('./pages/LimitUpLadder').then(m => ({ default: m.LimitUpLadder })))
+const Indices = lazyWithRetry(() => import('./pages/Indices').then(m => ({ default: m.Indices })))
+const Branding = lazyWithRetry(() => import('./pages/Branding').then(m => ({ default: m.Branding })))
+const Settings = lazyWithRetry(() => import('./pages/Settings').then(m => ({ default: m.Settings })))
+const Regime = lazyWithRetry(() => import('./pages/Regime').then(m => ({ default: m.Regime })))
+const AbnormalMoves = lazyWithRetry(() => import('./pages/AbnormalMoves').then(m => ({ default: m.AbnormalMoves })))
+const Dev = lazyWithRetry(() => import('./pages/Dev').then(m => ({ default: m.Dev })))
 
 const CORE_ROUTE_PATHS = new Set([
   '/',
@@ -112,8 +115,8 @@ function OnboardingGuard({ children }: { children: React.ReactNode }) {
 }
 
 export const router = createBrowserRouter([
-  { path: '/onboarding', element: <Onboarding /> },
-  { path: '/login', element: <Auth /> },
+  { path: '/onboarding', element: <Onboarding />, errorElement: <RouteError /> },
+  { path: '/login', element: <Auth />, errorElement: <RouteError /> },
   {
     path: '/',
     element: (
@@ -121,6 +124,7 @@ export const router = createBrowserRouter([
         <Layout />
       </OnboardingGuard>
     ),
+    errorElement: <RouteError />,
     children: [
       { index: true, element: <Dashboard /> },
       { path: 'overview', element: <Navigate to="/" replace /> },

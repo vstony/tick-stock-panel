@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client'
 import { RouterProvider } from 'react-router-dom'
 import { QueryClient, QueryClientProvider, QueryCache } from '@tanstack/react-query'
 import { initializeFrontendExtensions } from './extensions/bootstrap'
+import { importWithRetry } from './lib/lazyWithRetry'
 import './index.css'
 
 // 全局认证拦截: 任何 query/mutation 收到 401 (未登录/会话过期) → 跳登录页。
@@ -44,7 +45,8 @@ const queryClient = new QueryClient({
 
 async function bootstrap() {
   await initializeFrontendExtensions()
-  const { router } = await import('./router')
+  // router 也是动态导入: 模块图换代时同样会取不到, 走同一套「自动刷新一次」兜底
+  const { router } = await importWithRetry(() => import('./router'))
   ReactDOM.createRoot(document.getElementById('root')!).render(
     <React.StrictMode>
       <QueryClientProvider client={queryClient}>
