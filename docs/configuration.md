@@ -37,14 +37,15 @@ TickFlow 是内置默认数据源;同时支持插件化接入第三方数据源(
 
 - **TickFlow Expert**:配置 Expert 档 Key,零配置即用(修复轮 `intraday.batch` + 稳态 `intraday.universe` 单请求增量)
 - **插件/自定义源**:声明 `full_minute` 数据集并在 **设置 → 数据源 → 全量分钟** 路由到该源 — Python 插件实现 `get_intraday_batch`(必需)/`get_intraday_latest`(可选,未实现自动降级仅修复轮、节奏下限 60s);YAML 声明式源数据集配置与 `minute` 同形(仅修复轮语义)。契约细节见 [plugin-development.md](./plugin-development.md) 与 [custom-data-source.md](./custom-data-source.md)。
+- **扶摇(fuyao)插件**:上游没有分钟端点(见下方说明),所以它的 `full_minute` 是**快照轮询合成** — 每轮 1 次全市场快照请求,用相邻两轮「当日累计成交量/额」的增量还原分钟 K,按**仅修复轮**运行(节奏下限 60s)。`close`/`open` 为真实采样价、`volume`/`amount` 为该分钟真实增量,`high`/`low` 为采样近似(**60s 节奏下每桶 1 次采样,H/L 即 O/C 两点区间**);**冷启动前的分钟与断档的分钟不产出**(不插值、不补零),停牌标的整日无杆。刷新间隔建议 10–60s:**超过约 96s 时本源不再产出**(区间跨越多个连续竞价分钟无法归桶,宁可缺也不造假),缺的分钟请在盘后切/配一个分钟源(如 TickFlow、Tushare)补齐。
 
-> **前提:上游得有真·全市场数据能力**。「全量分钟」每轮把全市场标的都拉一遍(按 `batch` 分块),所以对纯按标的的 HTTP 上游只是个**批量模拟**:全市场 ≈ 5568 标的 / `batch` 20 ≈ **279 请求/轮**、每轮重拉当日全量(仅修复轮、不丢数据但请求量大)。要持续低成本跑全量分钟,请用 TickFlow Expert 的 `intraday.universe`,或写插件实现 `get_intraday_latest`(纯按标的的插件声明 `full_minute` 只会得到高代价的模拟)。实测 **Tushare 没有全市场分钟端点** —— `stk_mins` 按标的拉(单请求 8000 行静默截断)、`rt_min` 必填 `ts_code` 且返回无 `trade_time`、`rt_min_daily` 无权限(`40203`) —— 因此 Tushare 插件也不声明 `full_minute`(详见 [plugin-development.md](./plugin-development.md) 的插件说明)。
+> **上游需要有真·全市场数据能力**。「全量分钟」每轮把全市场标的都拉一遍(按 `batch` 分块),所以对纯按标的的 HTTP 上游只是个**批量模拟**:全市场 ≈ 5568 标的 / `batch` 20 ≈ **279 请求/轮**、每轮重拉当日全量(仅修复轮、不丢数据但请求量大)。要持续低成本跑全量分钟,请用 TickFlow Expert 的 `intraday.universe`,或写插件实现 `get_intraday_latest`(纯按标的的插件声明 `full_minute` 只会得到高代价的模拟)。实测 **Tushare 没有全市场分钟端点** —— `stk_mins` 按标的拉(单请求 8000 行静默截断)、`rt_min` 必填 `ts_code` 且返回无 `trade_time`、`rt_min_daily` 无权限(`40203`) —— 因此 Tushare 插件也不声明 `full_minute`(详见 [plugin-development.md](./plugin-development.md) 的插件说明)。**扶摇同样没有全市场分钟端点**:`prices/snapshot` 是单帧最新快照(每只只回 1 行,且传 `interval` 等参数会被服务端**静默忽略**)、`prices/historical` 的 `interval` 仅支持 `1d`(传 `1m` → `code=1002`)、唯一带 1 分钟的「高频动向」端点单标的且实测 `code=2004` 未开放外部接入、全市场 dump 也只有 `daily-k`/`daily-k-10d`/`adjustment-factors`(无分钟包) —— 故扶摇插件的 `full_minute` 只能是**快照轮询合成**(close/量额真实、开高低采样近似);要完整分钟历史仍应选 TickFlow Expert。
 
 接入步骤:
 
 1. **设置 → 凭据与能力**(TickFlow 路径)配置 API Key(Expert 档),或在 **设置 → 数据源** 声明/安装提供 `full_minute` 的源并路由;点「重新检测」后能力列表出现「全量分钟」
 2. **开启实时行情**后落盘服务自动启动;仅连续竞价时段(9:30–11:30 / 13:00–15:00)运行,午休/收盘自动暂停与恢复
-3. 冷启动(如 10 点才开服务)自动触发**全天修复轮**,一次批量补齐 9:30 起的全部缺口;稳态走**增量轮**(默认 6 秒一轮,可配 3–120 秒),幂等合并滚出全天
+3. 冷启动(如 10 点才开服务)自动触发**全天修复轮**,一次批量补齐 9:30 起的全部缺口 —— **快照合成型源(扶摇)除外**:它无法回溯冷启动前的分钟,只从开始轮询的那一刻起合成,缺口请用盘后分钟同步补;稳态走**增量轮**(默认 6 秒一轮,可配 3–120 秒),幂等合并滚出全天;仅修复轮的自定义源(含扶摇)节奏下限自动抬到 **60s**
 4. 与盘后分钟同步写同一分区(`unique(symbol, datetime)` 幂等合并),互不冲突
 
 说明:标的池为 A 股股票(CN_Equity_A),ETF 不在内(分时走批量补拉路径);覆盖滞后超阈值或连续空轮会自动再跑修复轮自愈。

@@ -543,7 +543,7 @@ PORT=3018                      # 服务端口
 
 本项目依赖 [TickFlow](https://tickflow.org/auth/register?ref=V3KDKGXPEA) 提供数据服务,使用前请遵守其服务条款
 
-内置数据源插件 [fuyao](https://fuyao.aicubes.cn/docs/api-reference/) 提供同花顺 REST 数据接口(行情 / 财务 / 龙虎榜 / 盘前风向标 / 交易日历等),需自备 API Key,使用前请遵守其服务条款
+内置数据源插件 [fuyao](https://fuyao.aicubes.cn/docs/api-reference/) 提供同花顺 REST 数据接口(行情 / 财务 / 龙虎榜 / 盘前风向标 / 交易日历等),需自备 API Key,使用前请遵守其服务条款。扶摇**没有分钟端点**,其「全量分钟」由全市场快照轮询**合成**(每轮 1 请求、仅修复轮 60s 节奏;close/成交量额真实,开高低为采样近似,冷启动与断档的分钟不产出),完整分钟历史请用 TickFlow
 
 内置数据源插件 [Tushare Pro](https://tushare.pro) 提供 A 股 / ETF / 指数日K、除权因子、分钟K、财务四表与标的维表(接口按积分等级限频,插件侧自限速 400 次/分钟),需自备 API Key,使用前请遵守其服务条款。Tushare **没有全市场分钟端点**(`stk_mins` 只能按标的拉、`rt_min` 必填 `ts_code` 且无 `trade_time`、`rt_min_daily` 无权限),故不提供「全量分钟」能力;需要时请用 TickFlow Expert 档
 

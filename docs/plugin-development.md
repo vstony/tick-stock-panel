@@ -238,6 +238,13 @@ provider 不应自行切换或回退到其他数据源。
 > 修复轮自愈。声明方式:插件在 `plugin.yaml` 的 `datasets:` 列表加入
 > `full_minute`。YAML 声明式源同样支持(数据集配置与 `minute` 同形,仅提供
 > 修复轮语义,见 [custom-data-source.md](./custom-data-source.md))。
+>
+> **快照轮询合成型源**(上游只有「全市场最新快照」、没有分钟端点,参考扶摇):每轮拉一次
+> 全市场快照,用「当日累计成交量/额」的相邻两轮增量还原分钟 K。这类源应**只实现
+> `get_intraday_batch`、不要实现 `get_intraday_latest`** — 后者的存在会把服务节奏抬到 6s
+> (10 请求/分钟),而快照合成无论如何都只能拿到每分钟一次采样;仅修复轮语义正好把节奏锁在
+> 60s,对上游与本地分区(每轮重写当日全市场)都友好。合成口径与真实性边界见
+> `app/plugins/fuyao/minute_synth.py` 的模块 docstring。
 
 ### 异常语义
 
@@ -312,10 +319,11 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
 ## 现有插件参考
 
 - **`backend/app/plugins/fuyao/`** — 同花顺官方 REST 数据源(runtime: none, 纯 HTTP 零依赖)
-  - 提供 `realtime`(A 股全市场快照, 分页拉取)、`daily`(原始价日K三档: 近端窗口走 daily-k-10d dump, 深窗口走 daily-k 10 年全量 dump(172MB 一次下载、缓存复用、10d 补尾), 兜底单标的接口按 10 年自动分片)、`adj_factor`(事件 dump + 前收盘价从本地日K dump 一次取齐、缺价标的回退单标的接口, 按交易所公式推导单事件比值, 涨跌停自检; 全市场配价从逐标的 ~13 分钟降为秒级); Key 在设置页卡片直接配置(先探后存), 或 `.env` 配 `FUYAO_API_KEY`
+  - 提供 `realtime`(A 股全市场快照, 分页拉取)、`daily`(原始价日K三档: 近端窗口走 daily-k-10d dump, 深窗口走 daily-k 10 年全量 dump(172MB 一次下载、缓存复用、10d 补尾), 兜底单标的接口按 10 年自动分片)、`adj_factor`(事件 dump + 前收盘价从本地日K dump 一次取齐、缺价标的回退单标的接口, 按交易所公式推导单事件比值, 涨跌停自检; 全市场配价从逐标的 ~13 分钟降为秒级)、`full_minute`(上游无分钟端点 → 用**全市场快照轮询合成**当日 1 分钟 K: 每轮 1 请求、仅修复轮 60s 节奏, close/成交量额真实、开高低为采样近似、冷启动与断档的分钟不产出; 正因如此**不实现** `get_intraday_latest`, 不把节奏抬到 6s); Key 在设置页卡片直接配置(先探后存), 或 `.env` 配 `FUYAO_API_KEY`
   - `client.py` — httpx 客户端(X-api-key 认证 + 统一信封解包 + 分页 + 页间隔限频 + 单标的日K + dump 预签名下载, S3 下载不带 Key 头)
+  - `minute_synth.py` — 快照→分钟K 合成内核(桶归属「区间起点分钟」、闭市区间归恢复首分钟、跨未观测竞价分钟整段丢弃、换日/累计量回退重置基线、陈旧快照整轮不采信; 单例状态 + 线程锁, provider/服务共享)
   - `provider.py` — Provider 实现(实测/文档双字段名映射、百分数→小数制、volume 股→手、上海零点戳 +8h 时区、dump 按 release 版本缓存、软失败、Key 探测)
-  - `tests/test_fuyao_provider.py` — 73 个契约测试, 是新插件的测试范本
+  - `tests/test_fuyao_provider.py`(73 例)与 `tests/test_fuyao_full_minute.py`(22 例: 合成状态机 + provider 帧契约 + 边界层落盘 + 服务端到端), 是新插件的测试范本
 - **`backend/app/plugins/tushare/`** — Tushare Pro 官方 HTTP 数据源(runtime: none, 直接 POST `api.tushare.pro`, 不依赖 `tushare` SDK / pandas)
   - 提供 `daily`(A 股 `daily` / ETF `fund_daily` / 指数 `index_daily`, 不复权原始价, 按接口 6000 行上限与逗号拼标的做行预算分批)、`adj_factor`(A 股 `adj_factor` / ETF `fund_adj`; Tushare 给的是累积因子, provider 用 `adj(D)/adj(D-1)` 换算为项目契约的单事件比值, 并按实测抖动阈值 3e-4 剔除因子修订噪声)、`minute`(`stk_mins`, 1/5/15/30/60min, 股票/ETF/指数, 按 8000 行上限做「标的数 x 时间窗」双重分批)、`financial`(内部 4 张表 → `fina_indicator`/`income`/`balancesheet`/`cashflow`, 金额单位元、指标百分数, 报告期按 `(symbol, period_end)` 唯一并保留最新公告行; **接口不支持多标的**, 只能逐只请求)、标的维表(`stock_basic` + 最新交易日 `daily_basic` 股本, 单位万股→股); Key 在设置页卡片直接配置(先探后存), 或 `.env` 配 `TUSHARE_API_KEY`
   - 未声明 `realtime`(Tushare 无全市场快照, 撑不住 6s 轮询)、`depth5`(不提供)、`full_minute`(`stk_mins` 只能按标的拉、无全市场批量端点; `rt_min` 必填 `ts_code` 且返回无 `trade_time`, `rt_min_daily` 无权限) → 这些数据集自动回退 TickFlow
